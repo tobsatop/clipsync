@@ -9,27 +9,18 @@ import (
 	"sync"
 )
 
-type Kind byte
-
-const (
-	Text  Kind = 1
-	Image Kind = 2
-)
-
-func (k Kind) String() string {
-	switch k {
-	case Text:
-		return "text"
-	case Image:
-		return "image"
-	}
-	return "unknown"
+// Item is one copy. It can hold text, an image, or both: some apps put both
+// on the clipboard (spreadsheet cells, for example) and the app you paste
+// into picks the one it understands.
+type Item struct {
+	Text  []byte // UTF-8 with \n line endings; nil if none
+	Image []byte // PNG; nil if none
 }
 
-// Item is one piece of clipboard content. Text is UTF-8 with \n line endings.
-type Item struct {
-	Kind Kind
-	Data []byte
+func (it Item) Empty() bool { return len(it.Text) == 0 && len(it.Image) == 0 }
+
+func (it Item) clone() Item {
+	return Item{Text: append([]byte(nil), it.Text...), Image: append([]byte(nil), it.Image...)}
 }
 
 var (
@@ -37,6 +28,9 @@ var (
 	ErrNothing = errors.New("nothing to sync on the clipboard")
 	// ErrSensitive means a password manager marked the content as secret.
 	ErrSensitive = errors.New("clipboard content is marked sensitive")
+	// ErrFiles means files were copied (as in Finder or Explorer), which
+	// clipsync does not send.
+	ErrFiles = errors.New("files were copied")
 )
 
 type Clipboard interface {
@@ -80,7 +74,7 @@ func (m *Memory) Copy(it Item, sensitive bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.seq++
-	m.item = Item{Kind: it.Kind, Data: append([]byte(nil), it.Data...)}
+	m.item = it.clone()
 	m.has = true
 	m.sensitive = sensitive
 }
@@ -114,14 +108,14 @@ func (m *Memory) Read(context.Context) (Item, error) {
 	if m.sensitive {
 		return Item{}, ErrSensitive
 	}
-	return Item{Kind: m.item.Kind, Data: append([]byte(nil), m.item.Data...)}, nil
+	return m.item.clone(), nil
 }
 
 func (m *Memory) Write(_ context.Context, it Item) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.seq++
-	m.item = Item{Kind: it.Kind, Data: append([]byte(nil), it.Data...)}
+	m.item = it.clone()
 	m.has = true
 	m.sensitive = false
 	m.writes++

@@ -3,6 +3,9 @@ package node
 import (
 	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/png"
 	"log"
 	"sync"
 	"testing"
@@ -67,7 +70,7 @@ func text(cb *clip.Memory) string {
 	if !ok {
 		return ""
 	}
-	return string(it.Data)
+	return string(it.Text)
 }
 
 // pairUp starts two connected nodes. Both know each other's address, so both
@@ -97,14 +100,14 @@ func TestSyncBothWaysWithoutEcho(t *testing.T) {
 		t.Fatal("connection did not survive the duplicate-dial race")
 	}
 
-	memA.Copy(clip.Item{Kind: clip.Text, Data: []byte("from Mac ไทย")}, false)
+	memA.Copy(clip.Item{Text: []byte("from Mac ไทย")}, false)
 	waitFor(t, "text on B", func() bool { return text(memB) == "from Mac ไทย" })
 
-	memB.Copy(clip.Item{Kind: clip.Text, Data: []byte("from Windows")}, false)
+	memB.Copy(clip.Item{Text: []byte("from Windows")}, false)
 	waitFor(t, "text on A", func() bool { return text(memA) == "from Windows" })
 
 	// Copying the first text again must still reach B, since B changed since.
-	memA.Copy(clip.Item{Kind: clip.Text, Data: []byte("from Mac ไทย")}, false)
+	memA.Copy(clip.Item{Text: []byte("from Mac ไทย")}, false)
 	waitFor(t, "text on B again", func() bool { return text(memB) == "from Mac ไทย" })
 
 	time.Sleep(300 * time.Millisecond)
@@ -115,7 +118,7 @@ func TestSyncBothWaysWithoutEcho(t *testing.T) {
 
 func TestSensitiveIsNotSent(t *testing.T) {
 	_, _, _, memA, memB := pairUp(t)
-	memA.Copy(clip.Item{Kind: clip.Text, Data: []byte("hunter2")}, true)
+	memA.Copy(clip.Item{Text: []byte("hunter2")}, true)
 	time.Sleep(300 * time.Millisecond)
 	if _, ok := memB.Current(); ok {
 		t.Fatal("sensitive content was sent")
@@ -143,7 +146,7 @@ func TestReconnectAfterPeerRestart(t *testing.T) {
 	b2.SetPeerAddr(a.ListenAddr())
 	waitFor(t, "reconnection", func() bool { return a.Connected() && b2.Connected() })
 
-	memA.Copy(clip.Item{Kind: clip.Text, Data: []byte("after restart")}, false)
+	memA.Copy(clip.Item{Text: []byte("after restart")}, false)
 	waitFor(t, "text after restart", func() bool { return text(memB) == "after restart" })
 	cancel()
 	a.Wait()
@@ -173,7 +176,7 @@ func TestCopyWhileDisconnectedArrivesOnReconnect(t *testing.T) {
 	memA, memB := clip.NewMemory(), clip.NewMemory()
 	a := newNode(t, ctx, "aaaa", "bbbb", key, memA)
 	time.Sleep(50 * time.Millisecond) // what was on the clipboard at start is not sent
-	memA.Copy(clip.Item{Kind: clip.Text, Data: []byte("copied while offline")}, false)
+	memA.Copy(clip.Item{Text: []byte("copied while offline")}, false)
 	time.Sleep(100 * time.Millisecond) // let A notice the copy
 
 	b := newNode(t, ctx, "bbbb", "aaaa", key, memB)
@@ -185,4 +188,60 @@ func TestCopyWhileDisconnectedArrivesOnReconnect(t *testing.T) {
 	cancel()
 	a.Wait()
 	b.Wait()
+}
+
+// testPNG makes a small valid PNG.
+func testPNG(t *testing.T, w, h int, c color.Color) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			img.Set(x, y, c)
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestImageAndTextPlusImage(t *testing.T) {
+	_, _, _, memA, memB := pairUp(t)
+	pic := testPNG(t, 64, 32, color.RGBA{255, 0, 0, 255})
+	memA.Copy(clip.Item{Image: pic}, false)
+	waitFor(t, "image on B", func() bool {
+		it, _ := memB.Current()
+		return bytes.Equal(it.Image, pic) && it.Text == nil
+	})
+
+	both := clip.Item{Text: []byte("A1\tB1\nA2\tB2"), Image: testPNG(t, 8, 8, color.White)}
+	memB.Copy(both, false)
+	waitFor(t, "text+image on A", func() bool {
+		it, _ := memA.Current()
+		return bytes.Equal(it.Image, both.Image) && string(it.Text) == string(both.Text)
+	})
+	time.Sleep(300 * time.Millisecond)
+	if memA.Writes() != 1 || memB.Writes() != 1 {
+		t.Fatalf("echo: A written %d times, B %d times (want 1 each)", memA.Writes(), memB.Writes())
+	}
+}
+
+func TestDecodeItemRejectsBadInput(t *testing.T) {
+	for name, b := range map[string][]byte{
+		"short":          {0, 0},
+		"length too big": {0, 0, 0, 9, 'h', 'i'},
+		"empty":          {0, 0, 0, 0},
+		"not png":        append([]byte{0, 0, 0, 0}, []byte("GIF89a....")...),
+		"bad utf8":       {0, 0, 0, 2, 0xff, 0xfe},
+	} {
+		if _, err := decodeItem(b); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	it := clip.Item{Text: []byte("hi\r\nthere"), Image: testPNG(t, 2, 2, color.Black)}
+	got, err := decodeItem(encodeItem(it))
+	if err != nil || string(got.Text) != "hi\nthere" || !bytes.Equal(got.Image, it.Image) {
+		t.Fatalf("round trip: %v %q", err, got.Text)
+	}
 }

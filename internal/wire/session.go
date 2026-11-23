@@ -18,11 +18,10 @@ import (
 
 // Message types inside an encrypted session.
 const (
-	MsgAuth  byte = 1
-	MsgText  byte = 2
-	MsgImage byte = 3
-	MsgPing  byte = 4
-	MsgAck   byte = 5 // payload: SHA-256 of the item received
+	MsgAuth byte = 1
+	MsgItem byte = 2 // payload: 4-byte text length, text, then PNG bytes
+	MsgPing byte = 4
+	MsgAck  byte = 5 // payload: SHA-256 of the item received
 )
 
 const writeTimeout = 2 * time.Minute

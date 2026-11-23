@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -23,6 +25,7 @@ import (
 
 const (
 	maxText      = 16 << 20
+	maxImage     = 48 << 20
 	pingEvery    = 10 * time.Second
 	readTimeout  = 35 * time.Second
 	beaconEvery  = 3 * time.Second
@@ -69,6 +72,11 @@ type Node struct {
 	dialing   bool
 	dialFails int
 	candidate string // address from a beacon; not trusted until a login works
+	// ignoreSeq is the clipboard counter right after we wrote a received
+	// item, so that write is not mistaken for a new copy (Windows reads an
+	// image back in a different encoding, so the hash alone is not enough).
+	ignoreSeq int64
+	hasIgnore bool
 	throttle  map[string]time.Time
 }
 
@@ -393,12 +401,13 @@ func (n *Node) serve(ctx context.Context, s *wire.Session) {
 				n.pending = nil
 			}
 			n.mu.Unlock()
-		case wire.MsgText:
-			if !utf8.Valid(payload) {
-				n.debugf("dropped text that is not valid UTF-8")
+		case wire.MsgItem:
+			it, err := decodeItem(payload)
+			if err != nil {
+				n.logf("Dropped an item from %s: %v", n.peer().Name, err)
 				continue
 			}
-			n.receive(ctx, s, clip.Item{Kind: clip.Text, Data: clip.NormalizeText(payload)})
+			n.receive(ctx, s, it)
 		default:
 			n.debugf("ignored message type %d", typ)
 		}
@@ -422,6 +431,12 @@ func (n *Node) clipLoop(ctx context.Context) {
 			continue
 		}
 		last = cur
+		n.mu.Lock()
+		ours := n.hasIgnore && cur == n.ignoreSeq
+		n.mu.Unlock()
+		if ours {
+			continue // our own write of a received item
+		}
 		n.onLocalCopy(ctx, cur)
 	}
 }
@@ -432,6 +447,9 @@ func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
 	case errors.Is(err, clip.ErrSensitive):
 		n.logf("Password copied — not sent (password-manager items stay on this computer)")
 		return
+	case errors.Is(err, clip.ErrFiles):
+		n.logThrottled("files", 10*time.Minute, "Files copied — not sent (only text and images are synced)")
+		return
 	case errors.Is(err, clip.ErrNothing):
 		return
 	case err != nil:
@@ -441,9 +459,16 @@ func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
 	if n.clip.Seq() != seq {
 		return // changed while we read it; the next tick handles the newer copy
 	}
-	if len(it.Data) > maxText {
-		n.logf("Copied %s is too large to send (%d MB)", it.Kind, len(it.Data)>>20)
+	if len(it.Text) > maxText {
+		n.logf("Copied text is too large to send (%d MB)", len(it.Text)>>20)
 		return
+	}
+	if len(it.Image) > maxImage {
+		if len(it.Text) == 0 {
+			n.logf("Copied image is too large to send (%d MB)", len(it.Image)>>20)
+			return
+		}
+		it.Image = nil // still send the text
 	}
 	h := hashItem(it)
 	n.mu.Lock()
@@ -465,7 +490,7 @@ func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
 }
 
 func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {
-	if err := s.Send(msgType(it.Kind), it.Data); err != nil {
+	if err := s.Send(wire.MsgItem, encodeItem(it)); err != nil {
 		n.logf("Could not send to %s (will retry on reconnect): %v", name, err)
 		s.Close()
 		return
@@ -492,9 +517,13 @@ func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
 			n.lastHash, n.hasHash = prevHash, prevHas
 		}
 		n.mu.Unlock()
-		n.logf("Received %s from %s but could not put it on the clipboard: %v", it.Kind, name, err)
+		n.logf("Received %s from %s but could not put it on the clipboard: %v", describe(it), name, err)
 		return
 	}
+	seq := n.clip.Seq()
+	n.mu.Lock()
+	n.ignoreSeq, n.hasIgnore = seq, true
+	n.mu.Unlock()
 	n.logf("Received from %s: %s — ready to paste", name, describe(it))
 }
 
@@ -572,25 +601,72 @@ func (n *Node) notePeerAddr(addr string) {
 
 func hashItem(it clip.Item) [32]byte {
 	h := sha256.New()
-	h.Write([]byte{byte(it.Kind)})
-	h.Write(it.Data)
+	var n [8]byte
+	binary.BigEndian.PutUint64(n[:], uint64(len(it.Text)))
+	h.Write(n[:])
+	h.Write(it.Text)
+	h.Write(it.Image)
 	var out [32]byte
 	copy(out[:], h.Sum(nil))
 	return out
 }
 
-func msgType(k clip.Kind) byte {
-	if k == clip.Image {
-		return wire.MsgImage
+// encodeItem lays out an item as: 4-byte text length, text, PNG bytes.
+func encodeItem(it clip.Item) []byte {
+	b := make([]byte, 4+len(it.Text)+len(it.Image))
+	binary.BigEndian.PutUint32(b, uint32(len(it.Text)))
+	copy(b[4:], it.Text)
+	copy(b[4+len(it.Text):], it.Image)
+	return b
+}
+
+func decodeItem(b []byte) (clip.Item, error) {
+	if len(b) < 4 {
+		return clip.Item{}, errors.New("malformed item")
 	}
-	return wire.MsgText
+	n := binary.BigEndian.Uint32(b)
+	if uint64(n) > uint64(len(b)-4) {
+		return clip.Item{}, errors.New("malformed item")
+	}
+	it := clip.Item{Text: b[4 : 4+n], Image: b[4+n:]}
+	if len(it.Text) == 0 {
+		it.Text = nil
+	}
+	if len(it.Image) == 0 {
+		it.Image = nil
+	}
+	if !utf8.Valid(it.Text) {
+		return clip.Item{}, errors.New("text is not valid UTF-8")
+	}
+	it.Text = clip.NormalizeText(it.Text)
+	if it.Image != nil {
+		if err := clip.CheckPNG(it.Image); err != nil {
+			return clip.Item{}, err
+		}
+	}
+	if it.Empty() {
+		return clip.Item{}, errors.New("empty item")
+	}
+	return it, nil
 }
 
 func describe(it clip.Item) string {
-	if it.Kind == clip.Text {
-		return fmt.Sprintf("text, %d characters", utf8.RuneCount(it.Data))
+	var parts []string
+	if len(it.Text) > 0 {
+		parts = append(parts, fmt.Sprintf("text, %d characters", utf8.RuneCount(it.Text)))
 	}
-	return fmt.Sprintf("%s, %d KB", it.Kind, (len(it.Data)+1023)/1024)
+	if len(it.Image) > 0 {
+		w, h := clip.ImageSize(it.Image)
+		parts = append(parts, fmt.Sprintf("image %dx%d, %s", w, h, size(len(it.Image))))
+	}
+	return strings.Join(parts, " + ")
+}
+
+func size(n int) string {
+	if n >= 1<<20 {
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	}
+	return fmt.Sprintf("%d KB", (n+1023)/1024)
 }
 
 // Logging never happens while n.mu is held, and the writer given by main

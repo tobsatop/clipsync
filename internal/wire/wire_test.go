@@ -140,23 +140,23 @@ func TestSessionBothWays(t *testing.T) {
 	}
 	thai := "สวัสดี clipboard\nบรรทัดสอง"
 	for i := 0; i < 3; i++ {
-		if err := cli.Send(MsgText, []byte(thai)); err != nil {
+		if err := cli.Send(MsgItem, []byte(thai)); err != nil {
 			t.Fatal(err)
 		}
 		typ, got, err := srv.Recv(time.Second)
-		if err != nil || typ != MsgText || string(got) != thai {
+		if err != nil || typ != MsgItem || string(got) != thai {
 			t.Fatalf("server got %d %q %v", typ, got, err)
 		}
-		if err := srv.Send(MsgText, []byte("back")); err != nil {
+		if err := srv.Send(MsgItem, []byte("back")); err != nil {
 			t.Fatal(err)
 		}
 		typ, got, err = cli.Recv(time.Second)
-		if err != nil || typ != MsgText || string(got) != "back" {
+		if err != nil || typ != MsgItem || string(got) != "back" {
 			t.Fatalf("client got %d %q %v", typ, got, err)
 		}
 	}
 	big := bytes.Repeat([]byte("x"), 5<<20)
-	go cli.Send(MsgText, big)
+	go cli.Send(MsgItem, big)
 	if _, got, err := srv.Recv(5 * time.Second); err != nil || !bytes.Equal(got, big) {
 		t.Fatalf("large message: %v", err)
 	}

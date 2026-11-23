@@ -11,7 +11,7 @@ import (
 
 const (
 	appName      = "clipsync"
-	protoVersion = 1
+	protoVersion = 2 // 2: items carry text and/or an image
 
 	// handshakeMax caps every message sent before the peer is authenticated,
 	// so a stranger cannot make us allocate much.
