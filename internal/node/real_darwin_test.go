@@ -103,6 +103,9 @@ func savePasteboard(t *testing.T) (restore func()) {
 // TestPasteboardSnapshot checks the snapshot scripts on a private pasteboard,
 // so it never touches the user's clipboard.
 func TestPasteboardSnapshot(t *testing.T) {
+	if os.Getenv("CI") != "" {
+		t.Skip("needs a logged-in Mac session")
+	}
 	pb := "$.NSPasteboard.pasteboardWithName('clipsync-snapshot-test')"
 	path := filepath.Join(t.TempDir(), "pb.plist")
 	osa(t, `var pb=`+pb+`; pb.clearContents; var a=$.NSPasteboardItem.alloc.init;

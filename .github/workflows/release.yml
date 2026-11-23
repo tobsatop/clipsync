@@ -1,0 +1,44 @@
+# Builds clipsync and publishes a GitHub Release when a version tag is
+# pushed, e.g.:  git tag v0.3.1 && git push origin v0.3.1
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # to create the release
+
+jobs:
+  release:
+    runs-on: macos-latest # Apple silicon; also cross-builds the Windows .exe files
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Check the tag matches the version in main.go
+        run: |
+          VERSION=$(sed -n 's/^const version = "\(.*\)"/\1/p' main.go)
+          test "v$VERSION" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME but main.go says $VERSION"; exit 1; }
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: |
+          ./scripts/build.sh
+          ditto -c -k --keepParent dist/clipsync.app dist/clipsync-mac.zip
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/clipsync-mac.zip \
+            dist/clipsync-windows-amd64.exe \
+            dist/clipsync-windows-arm64.exe \
+            --title "clipsync $GITHUB_REF_NAME" \
+            --notes-file .github/release-notes.md
