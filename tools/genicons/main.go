@@ -3,6 +3,7 @@
 //	-syso DIR     Windows resource objects (rsrc_windows_<arch>.syso) that
 //	              go build links into the .exe, so Explorer shows the icon
 //	-iconset DIR  a macOS .iconset folder, for iconutil to turn into .icns
+//	-png FILE     the app icon as a 256-pixel PNG (for the README)
 package main
 
 import (
@@ -21,7 +22,13 @@ import (
 func main() {
 	syso := flag.String("syso", "", "directory for rsrc_windows_*.syso")
 	iconset := flag.String("iconset", "", "directory for the macOS iconset")
+	pngOut := flag.String("png", "", "file for a 256-pixel PNG of the app icon")
 	flag.Parse()
+	if *pngOut != "" {
+		if err := os.WriteFile(*pngOut, icons.PNG(icons.Render(256, icons.App(0.04))), 0o644); err != nil {
+			log.Fatal(err)
+		}
+	}
 	if *syso != "" {
 		if err := writeSyso(*syso); err != nil {
 			log.Fatal(err)
