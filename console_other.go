@@ -2,5 +2,7 @@
 
 package main
 
-func setupConsole() {}
-func useConsole()   {}
+func setupConsole()   {}
+func useConsole(bool) {}
+
+const ownConsole = false

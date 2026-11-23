@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+	"time"
 
 	"clipsync/internal/clip"
 	"clipsync/internal/config"
@@ -24,7 +25,10 @@ import (
 
 const version = "0.3.0"
 
-var commands = []string{"tray", "run", "pair", "status", "unpair", "help", "version"}
+var commands = []string{"tray", "run", "pair", "status", "unpair", "help", "version", "pair-window"}
+
+// errRunning means the menu-bar / tray copy holds the settings.
+var errRunning = errors.New("clipsync is running in the menu bar / next to the clock — quit it first (click its icon, then Quit clipsync)")
 
 func main() { os.Exit(run()) }
 
@@ -33,13 +37,15 @@ func run() int {
 	fs.Usage = usage
 	peerAddr := fs.String("peer", "", "")
 	verbose := fs.Bool("v", false, "")
+	firstRun := fs.Bool("first-run", false, "") // set by the Windows installer step
 	flags, pos := splitArgs(os.Args[1:])
 	cmd := "tray" // double-clicked, or started at login
 	if len(pos) > 0 {
 		cmd, pos = pos[0], pos[1:]
 	}
-	if cmd != "tray" || len(flags) > 0 {
-		useConsole() // Windows: a console for text output; no-op elsewhere
+	if cmd != "tray" {
+		// Windows: a console for text; no-op elsewhere.
+		useConsole(cmd == "run" || cmd == "pair" || cmd == "pair-window")
 	}
 	if err := fs.Parse(flags); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -51,7 +57,7 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := dispatch(ctx, cmd, pos, *peerAddr, *verbose); err != nil {
+	if err := dispatch(ctx, cmd, pos, *peerAddr, *verbose, *firstRun); err != nil {
 		if ctx.Err() != nil || errors.Is(err, errCanceled) {
 			return 0 // stopped with Ctrl+C, or the person cancelled
 		}
@@ -101,7 +107,7 @@ func splitArgs(args []string) (flags, pos []string) {
 	return flags, pos
 }
 
-func dispatch(ctx context.Context, cmd string, pos []string, peerAddr string, verbose bool) error {
+func dispatch(ctx context.Context, cmd string, pos []string, peerAddr string, verbose, firstRun bool) error {
 	if !slices.Contains(commands, cmd) {
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -123,7 +129,19 @@ func dispatch(ctx context.Context, cmd string, pos []string, peerAddr string, ve
 	if err != nil {
 		return err
 	}
-	if peerAddr != "" && cfg.Peer != nil && (cmd == "run" || cmd == "tray") {
+	if cmd == "tray" {
+		return runTray(ctx, cfg, dir, peerAddr, verbose, firstRun)
+	}
+	// Commands that change settings or use the ports must not run beside
+	// the tray copy (pair-window is started by the tray itself).
+	if cmd == "run" || cmd == "pair" || cmd == "unpair" {
+		release, err := acquireInstanceLock(dir)
+		if err != nil {
+			return errRunning
+		}
+		defer release()
+	}
+	if peerAddr != "" && cfg.Peer != nil && cmd == "run" {
 		cfg.Peer.Addr = withDefaultPort(peerAddr)
 		if err := cfg.Save(dir); err != nil {
 			return err
@@ -131,8 +149,16 @@ func dispatch(ctx context.Context, cmd string, pos []string, peerAddr string, ve
 	}
 
 	switch cmd {
-	case "tray":
-		return runTray(ctx, cfg, dir, verbose)
+	case "pair-window":
+		fmt.Println("clipsync — pairing")
+		fmt.Println()
+		res, err := pairInteractive(ctx, cfg, dir, peerAddr, consoleUI{})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("\nSyncing with %s starts again in the background. This window closes in a moment.\n", res.PeerName)
+		time.Sleep(3 * time.Second)
+		return nil
 	case "run":
 		if cfg.Peer == nil {
 			if _, err := pairInteractive(ctx, cfg, dir, peerAddr, consoleUI{}); err != nil {
@@ -251,7 +277,7 @@ func (a *asyncWriter) Write(p []byte) (int, error) {
 // pauseOnWindows keeps a console window that clipsync opened long enough to
 // read the result.
 func pauseOnWindows() {
-	if runtime.GOOS != "windows" {
+	if runtime.GOOS != "windows" || !ownConsole {
 		return
 	}
 	fmt.Print("\nPress Enter to close this window...")

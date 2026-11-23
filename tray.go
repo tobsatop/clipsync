@@ -5,10 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"fyne.io/systray"
 
@@ -20,30 +20,54 @@ import (
 // trayApp is clipsync as a menu-bar (Mac) or notification-area (Windows)
 // icon: no window to keep open, a small menu, and a log file.
 type trayApp struct {
-	ctx     context.Context
-	cfg     *config.Config
-	dir     string
-	verbose bool
-	log     *log.Logger
-	logPath string
-	clip    clip.Clipboard
+	ctx      context.Context
+	cancel   context.CancelFunc
+	dir      string
+	verbose  bool
+	firstRun bool
+	log      *log.Logger
+	logPath  string
+	clip     clip.Clipboard
 
 	mu       sync.Mutex
+	cfg      *config.Config
 	node     *node.Node
 	stopNode context.CancelFunc
 	paused   bool
 	pairing  bool
 
+	// All menu text and the icon are updated by uiLoop alone, from ui.
+	uiMu   sync.Mutex
+	ui     uiState
+	uiKick chan struct{}
+
 	mStatus, mLast, mPause, mLogin, mPair, mLog, mQuit *systray.MenuItem
 }
 
-func runTray(ctx context.Context, cfg *config.Config, dir string, verbose bool) error {
-	// One clipsync per computer: the sync port doubles as the lock.
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
+type uiState struct {
+	note string // overrides the status line, e.g. "Pairing..."
+	st   node.Status
+}
+
+func runTray(ctx context.Context, cfg *config.Config, dir, peerAddr string, verbose, firstRun bool) error {
+	handoff, first, err := prepareTray(cfg, dir)
 	if err != nil {
-		return fmt.Errorf("clipsync is already running (look for its icon), or another app uses port %d", cfg.Port)
+		return err
 	}
-	ln.Close()
+	if handoff {
+		return nil // the installed copy takes over
+	}
+	release, err := acquireInstanceLock(dir)
+	if err != nil {
+		return errors.New("clipsync is already running — look for its icon in the menu bar or next to the clock")
+	}
+	defer release()
+	if peerAddr != "" && cfg.Peer != nil {
+		cfg.Peer.Addr = withDefaultPort(peerAddr)
+		if err := cfg.Save(dir); err != nil {
+			return err
+		}
+	}
 
 	logger, logPath, closeLog, err := openLog(dir)
 	if err != nil {
@@ -54,9 +78,15 @@ func runTray(ctx context.Context, cfg *config.Config, dir string, verbose bool) 
 	if err != nil {
 		return fmt.Errorf("cannot use the clipboard: %w", err)
 	}
-	a := &trayApp{ctx: ctx, cfg: cfg, dir: dir, verbose: verbose, log: logger, logPath: logPath, clip: cb}
+	actx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	a := &trayApp{
+		ctx: actx, cancel: cancel, cfg: cfg, dir: dir, verbose: verbose,
+		firstRun: firstRun || first, log: logger, logPath: logPath, clip: cb,
+		uiKick: make(chan struct{}, 1),
+	}
 	logger.Printf("clipsync %s starting on %s", version, cfg.Name)
-	systray.Run(a.onReady, a.stop)
+	systray.Run(a.onReady, a.onExit)
 	logger.Printf("clipsync stopped")
 	return nil
 }
@@ -94,15 +124,20 @@ func (a *trayApp) onReady() {
 	systray.AddSeparator()
 	a.mQuit = systray.AddMenuItem("Quit clipsync", "")
 
-	a.setupAutostart()
+	go a.uiLoop()
 	go a.menuLoop()
 	go func() {
 		<-a.ctx.Done()
 		systray.Quit()
 	}()
+	if a.firstRun {
+		go firstRunHint()
+	}
 	go func() {
-		if a.cfg.Peer == nil {
-			a.mStatus.SetTitle("Not paired yet")
+		a.mu.Lock()
+		paired := a.cfg.Peer != nil
+		a.mu.Unlock()
+		if !paired {
 			a.repair()
 			return
 		}
@@ -110,32 +145,26 @@ func (a *trayApp) onReady() {
 	}()
 }
 
-// setupAutostart turns start-at-login on the first time clipsync runs as an
-// app, and afterwards keeps the login item pointing at this copy.
-func (a *trayApp) setupAutostart() {
-	if !a.cfg.AutostartSet {
-		a.cfg.AutostartSet = true
-		if err := setAutostart(true); err != nil {
-			a.log.Printf("Could not set up start at login: %v", err)
-		} else {
-			a.mLogin.Check()
-		}
-		if err := a.cfg.Save(a.dir); err != nil {
-			a.log.Printf("Could not save settings: %v", err)
-		}
-		go firstRunHint()
-		return
-	}
-	if autostartEnabled() {
-		if err := setAutostart(true); err != nil {
-			a.log.Printf("Could not update start at login: %v", err)
-		}
+// onExit runs when the menu loop ends. It must not wait long: on macOS it
+// runs on the main thread, which the menu needs.
+func (a *trayApp) onExit() {
+	a.cancel()
+	done := make(chan struct{})
+	go func() {
+		a.stop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
 	}
 }
 
 func (a *trayApp) menuLoop() {
 	for {
 		select {
+		case <-a.ctx.Done():
+			return
 		case <-a.mPause.ClickedCh:
 			p := !a.mPause.Checked()
 			if p {
@@ -160,11 +189,59 @@ func (a *trayApp) menuLoop() {
 		case <-a.mLog.ClickedCh:
 			openPath(a.logPath)
 		case <-a.mQuit.ClickedCh:
-			systray.Quit()
+			a.cancel() // also closes any pairing dialog
 			return
 		}
 	}
 }
+
+// --- what the menu shows -------------------------------------------------
+
+func (a *trayApp) updateUI(f func(*uiState)) {
+	a.uiMu.Lock()
+	f(&a.ui)
+	a.uiMu.Unlock()
+	select {
+	case a.uiKick <- struct{}{}:
+	default: // an update is already pending; it will read the latest state
+	}
+}
+
+func (a *trayApp) uiLoop() {
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-a.uiKick:
+		}
+		a.uiMu.Lock()
+		s := a.ui
+		a.uiMu.Unlock()
+
+		var title string
+		switch {
+		case s.note != "":
+			title = s.note
+		case s.st.Paused:
+			title = "Paused"
+		case s.st.Connected:
+			title = "Connected to " + s.st.Peer
+		case s.st.Peer != "":
+			title = "Waiting for " + s.st.Peer + "..."
+		default:
+			title = "Starting..."
+		}
+		a.mStatus.SetTitle(title)
+		systray.SetTooltip("clipsync — " + title)
+		setTrayIcon(s.note == "" && s.st.Connected && !s.st.Paused)
+		if s.st.Last != "" {
+			a.mLast.SetTitle(fmt.Sprintf("Last: %s (%s)", s.st.Last, s.st.LastAt.Format("15:04")))
+			a.mLast.Show()
+		}
+	}
+}
+
+// --- the sync engine -------------------------------------------------------
 
 func (a *trayApp) setPaused(p bool) {
 	a.mu.Lock()
@@ -172,9 +249,9 @@ func (a *trayApp) setPaused(p bool) {
 	n := a.node
 	a.mu.Unlock()
 	if n != nil {
-		n.SetPaused(p)
+		n.SetPaused(p) // reports through onStatus
 	} else {
-		a.showIdle()
+		a.updateUI(func(s *uiState) { s.st.Paused = p })
 	}
 	a.log.Printf("Syncing paused: %v", p)
 }
@@ -188,36 +265,32 @@ func (a *trayApp) start() {
 	}
 	if a.cfg.Peer == nil {
 		a.mu.Unlock()
-		a.mStatus.SetTitle("Not paired yet — choose Pair below")
+		a.updateUI(func(s *uiState) { s.note = "Not paired yet — choose Pair below" })
 		return
 	}
+	paused := a.paused
+	peer := a.cfg.Peer.Name
+	a.updateUI(func(s *uiState) { *s = uiState{st: node.Status{Peer: peer, Paused: paused}} })
 	nctx, cancel := context.WithCancel(a.ctx)
 	var n *node.Node
 	n = node.New(a.cfg, a.dir, a.clip, a.log, node.Options{
 		Verbose:  a.verbose,
+		Paused:   paused,
 		OnStatus: func(st node.Status) { a.onStatus(n, st) },
 	})
 	if err := n.Start(nctx); err != nil {
 		a.mu.Unlock()
 		cancel()
 		a.log.Printf("Could not start: %v", err)
-		a.mStatus.SetTitle("Not running — see log")
+		a.updateUI(func(s *uiState) { s.note = "Not running — see log" })
 		go alert("clipsync could not start syncing", err.Error())
 		return
 	}
 	a.node, a.stopNode = n, cancel
-	paused := a.paused
-	peer := a.cfg.Peer.Name
-	a.mu.Unlock() // OnStatus takes a.mu, so nothing below may hold it
-
-	a.mStatus.SetTitle("Waiting for " + peer + "...")
-	systray.SetTooltip("clipsync — waiting for " + peer)
-	if paused {
-		n.SetPaused(true)
-	}
+	a.mu.Unlock()
 }
 
-// stop shuts the sync engine down (also called when the app quits).
+// stop shuts the sync engine down.
 func (a *trayApp) stop() {
 	a.mu.Lock()
 	n, cancel := a.node, a.stopNode
@@ -227,45 +300,19 @@ func (a *trayApp) stop() {
 		cancel()
 		n.Wait()
 	}
-	setTrayIcon(false)
 }
 
 func (a *trayApp) onStatus(n *node.Node, st node.Status) {
 	a.mu.Lock()
-	current := a.node == n
+	current := a.node == n // start() holds a.mu until a.node is set
 	a.mu.Unlock()
-	if !current {
-		return // a stopped engine reporting late
-	}
-	var title string
-	switch {
-	case st.Paused:
-		title = "Paused"
-	case st.Connected:
-		title = "Connected to " + st.Peer
-	default:
-		title = "Waiting for " + st.Peer + "..."
-	}
-	a.mStatus.SetTitle(title)
-	systray.SetTooltip("clipsync — " + title)
-	setTrayIcon(st.Connected && !st.Paused)
-	if st.Last != "" {
-		a.mLast.SetTitle(fmt.Sprintf("Last: %s (%s)", st.Last, st.LastAt.Format("15:04")))
-		a.mLast.Show()
+	if current {
+		a.updateUI(func(s *uiState) { s.st = st })
 	}
 }
 
-func (a *trayApp) showIdle() {
-	a.mu.Lock()
-	paused := a.paused
-	a.mu.Unlock()
-	if paused {
-		a.mStatus.SetTitle("Paused")
-	}
-}
-
-// repair stops syncing, pairs (with dialogs on the Mac, a console window on
-// Windows), and starts syncing again.
+// repair stops syncing, pairs (dialogs on the Mac, a separate console window
+// on Windows), and starts syncing again.
 func (a *trayApp) repair() {
 	a.mu.Lock()
 	if a.pairing {
@@ -281,22 +328,20 @@ func (a *trayApp) repair() {
 	}()
 
 	a.stop()
-	a.mStatus.SetTitle("Pairing...")
-	ui, done, err := newTrayPairUI(a.log)
-	if err != nil {
-		go alert("clipsync", "Cannot show the pairing window: "+err.Error())
-	} else {
-		res, err := pairInteractive(a.ctx, a.cfg, a.dir, "", ui)
-		done()
-		switch {
-		case err == nil:
-			a.log.Printf("Paired with %s", res.PeerName)
-			notify("clipsync", "Paired with "+res.PeerName)
-		case errors.Is(err, errCanceled) || a.ctx.Err() != nil:
-		default:
-			a.log.Printf("Pairing failed: %v", err)
-			go alert("Pairing failed", err.Error())
-		}
+	a.updateUI(func(s *uiState) { s.note = "Pairing..." })
+	cfg, peer, err := trayPair(a)
+	switch {
+	case err == nil:
+		a.log.Printf("Paired with %s", peer)
+		a.mu.Lock()
+		a.cfg = cfg
+		a.mu.Unlock()
+		notify("clipsync", "Paired with "+peer)
+	case errors.Is(err, errCanceled) || a.ctx.Err() != nil:
+	default:
+		a.log.Printf("Pairing failed: %v", err)
+		go alert("Pairing failed", err.Error())
 	}
+	a.updateUI(func(s *uiState) { s.note = "" })
 	a.start()
 }

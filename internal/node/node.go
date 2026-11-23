@@ -43,9 +43,12 @@ type Options struct {
 	PollInterval time.Duration // how often to check the clipboard; default 250ms
 	RedialEvery  time.Duration // how often to retry the peer; default 5s
 	Verbose      bool
-	// OnStatus, if set, is called (from any goroutine) whenever the
-	// connection or the last transfer changes.
+	// OnStatus, if set, is called whenever the connection or the last
+	// transfer changes. Calls never overlap and arrive in order; it must
+	// return quickly.
 	OnStatus func(Status)
+	// Paused starts the node paused (see SetPaused).
+	Paused bool
 }
 
 // Status is what a tray icon shows.
@@ -77,6 +80,8 @@ type Node struct {
 	hsSem  chan struct{}
 	wg     sync.WaitGroup
 	saveMu sync.Mutex
+	// statusMu keeps OnStatus calls in order.
+	statusMu sync.Mutex
 	// clipMu makes "read a local copy and record it" and "write a received
 	// item and record it" happen one at a time, so neither can overwrite
 	// the other's bookkeeping halfway.
@@ -111,6 +116,8 @@ func New(cfg *config.Config, dir string, cb clip.Clipboard, logger *log.Logger, 
 		cfg: cfg, dir: dir, clip: cb, log: logger, opt: opt,
 		hsSem:    make(chan struct{}, maxHandshake),
 		throttle: map[string]time.Time{},
+		paused:   opt.Paused,
+		status:   Status{Paused: opt.Paused},
 	}
 }
 
@@ -199,6 +206,8 @@ func (n *Node) SetPaused(p bool) {
 
 // report applies change to the status and passes a copy to OnStatus.
 func (n *Node) report(change func(*Status)) {
+	n.statusMu.Lock()
+	defer n.statusMu.Unlock()
 	n.mu.Lock()
 	change(&n.status)
 	n.status.Peer = n.cfg.Peer.Name

@@ -22,39 +22,30 @@ var (
 
 const attachParentProcess = ^uintptr(0) // ATTACH_PARENT_PROCESS
 
-// useConsole gives a command a console: the one it was started from, or a
-// new window.
-func useConsole() {
+// ownConsole is true when clipsync opened its own console window (so it
+// should pause before the window closes).
+var ownConsole bool
+
+// useConsole gives a command a console. Interactive commands get a window
+// of their own: cmd.exe does not wait for a GUI program, so sharing its
+// console would mean both reading the same keystrokes. Commands that only
+// print attach to the console they were started from, if any.
+func useConsole(interactive bool) {
 	if w, _, _ := procGetConsoleWindow.Call(); w != 0 {
 		return // already has one (e.g. a console build)
 	}
-	if r, _, _ := procAttachConsole.Call(attachParentProcess); r == 0 {
-		if r, _, _ := procAllocConsole.Call(); r == 0 {
+	if !interactive {
+		if r, _, _ := procAttachConsole.Call(attachParentProcess); r != 0 {
+			bindConsole()
 			return
 		}
 	}
-	bindConsole()
-}
-
-// openConsole opens a new console window for a while (pairing from the
-// tray) and returns a function that closes it.
-func openConsole() (func(), error) {
-	if r, _, err := procAllocConsole.Call(); r == 0 {
-		return nil, err
+	if r, _, _ := procAllocConsole.Call(); r == 0 {
+		return
 	}
-	oldIn, oldOut, oldErr, oldReader := os.Stdin, os.Stdout, os.Stderr, stdin
-	in, out := bindConsole()
+	ownConsole = true
+	bindConsole()
 	setupConsole()
-	return func() {
-		os.Stdin, os.Stdout, os.Stderr, stdin = oldIn, oldOut, oldErr, oldReader
-		if in != nil {
-			in.Close()
-		}
-		if out != nil {
-			out.Close()
-		}
-		procFreeConsole.Call()
-	}, nil
 }
 
 func bindConsole() (in, out *os.File) {

@@ -4,12 +4,12 @@ package main
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 
 	"fyne.io/systray"
 
+	"clipsync/internal/config"
 	"clipsync/internal/icons"
 )
 
@@ -22,7 +22,15 @@ func notify(title, msg string) {}
 func firstRunHint()            {}
 func openPath(p string)        { exec.Command("xdg-open", p).Start() }
 
-func newTrayPairUI(*log.Logger) (pairUI, func(), error) { return consoleUI{}, func() {}, nil }
+func prepareTray(*config.Config, string) (bool, bool, error) { return false, false, nil }
+
+func trayPair(a *trayApp) (*config.Config, string, error) {
+	res, err := pairInteractive(a.ctx, a.cfg, a.dir, "", consoleUI{})
+	if err != nil {
+		return nil, "", err
+	}
+	return a.cfg, res.PeerName, nil
+}
 
 func autostartEnabled() bool  { return false }
 func setAutostart(bool) error { return nil }

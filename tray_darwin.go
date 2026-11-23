@@ -17,6 +17,7 @@ import (
 
 	"fyne.io/systray"
 
+	"clipsync/internal/config"
 	"clipsync/internal/icons"
 )
 
@@ -73,10 +74,48 @@ func firstRunHint() {
 
 func openPath(p string) { exec.Command("open", "-t", p).Start() }
 
-type dialogUI struct{ log *log.Logger }
+// prepareTray turns start-at-login on the first time clipsync runs as an
+// app, and afterwards keeps the login item pointing at this copy.
+func prepareTray(cfg *config.Config, dir string) (handoff, first bool, err error) {
+	first = !cfg.AutostartSet
+	if first {
+		cfg.AutostartSet = true
+		if err := cfg.Save(dir); err != nil {
+			return false, false, err
+		}
+	}
+	if (first || autostartEnabled()) && inAppBundle() {
+		setAutostart(true) // best effort; the menu shows the result
+	}
+	return false, first, nil
+}
 
-func newTrayPairUI(logger *log.Logger) (pairUI, func(), error) {
-	return dialogUI{log: logger}, func() {}, nil
+// inAppBundle reports whether this is clipsync.app at a stable place, the
+// only kind of copy worth starting at login (a bare binary has no Local
+// Network permission text; a translocated app lives in a temporary path).
+func inAppBundle() bool {
+	exe, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(exe, ".app/Contents/MacOS/") && !strings.Contains(exe, "/AppTranslocation/")
+}
+
+// trayPair pairs with dialog boxes.
+func trayPair(a *trayApp) (*config.Config, string, error) {
+	a.mu.Lock()
+	cfg := a.cfg
+	a.mu.Unlock()
+	res, err := pairInteractive(a.ctx, cfg, a.dir, "", dialogUI{ctx: a.ctx, log: a.log})
+	if err != nil {
+		return nil, "", err
+	}
+	return cfg, res.PeerName, nil
+}
+
+type dialogUI struct {
+	ctx context.Context
+	log *log.Logger
 }
 
 func (d dialogUI) Choose(ctx context.Context, thisName string) (bool, error) {
@@ -105,7 +144,7 @@ func (d dialogUI) ShowCode(code string, addrs []string) (<-chan struct{}, func()
 	if len(addrs) > 0 {
 		msg += "\n\n(This Mac's address: " + strings.Join(addrs, ", ") + ")"
 	}
-	cmd := exec.Command("osascript", "-e", `display dialog `+asQuote(msg)+
+	cmd := exec.CommandContext(d.ctx, "osascript", "-e", `display dialog `+asQuote(msg)+
 		` buttons {"Cancel"} default button "Cancel" cancel button "Cancel" with title "clipsync" giving up after 600`)
 	cancelled := make(chan struct{})
 	var closing sync.Once
@@ -153,6 +192,9 @@ func setAutostart(on bool) error {
 			return err
 		}
 		return nil
+	}
+	if !inAppBundle() {
+		return errors.New("start at login works when clipsync runs as clipsync.app from the Applications folder")
 	}
 	exe, err := os.Executable()
 	if err != nil {
