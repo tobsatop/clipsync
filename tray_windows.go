@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -73,7 +74,13 @@ func trayPair(a *trayApp) (*config.Config, string, error) {
 		return nil, "", err
 	}
 	cmd := exec.CommandContext(a.ctx, exe, "pair-window")
-	cmd.Run() // its window shows any error itself
+	if err := cmd.Run(); err != nil {
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) && a.ctx.Err() == nil {
+			return nil, "", fmt.Errorf("cannot open the pairing window: %w", err)
+		}
+		// otherwise its window has shown what went wrong
+	}
 	cfg, err := config.Load(a.dir)
 	if err != nil {
 		return nil, "", err
@@ -90,7 +97,10 @@ func trayPair(a *trayApp) (*config.Config, string, error) {
 // the installed copy at the next login would ask again (and, if missed,
 // block the Mac). A copy started from anywhere else installs itself, starts
 // the installed copy, and exits (handoff).
-func prepareTray(cfg *config.Config, dir string) (handoff, first bool, err error) {
+//
+// release drops this process's instance lock just before the installed copy
+// starts, so that copy can take it; extra arguments (like -v) are passed on.
+func prepareTray(cfg *config.Config, dir string, extra []string, release func()) (handoff, first bool, err error) {
 	first = !cfg.AutostartSet
 	if first {
 		cfg.AutostartSet = true
@@ -111,15 +121,23 @@ func prepareTray(cfg *config.Config, dir string) (handoff, first bool, err error
 		return false, first, nil
 	}
 	if err := copyFile(exe, dst); err != nil {
-		return false, first, nil // e.g. the installed copy is running; the lock reports it
+		if _, statErr := os.Stat(dst); statErr == nil {
+			// The installed copy exists but cannot be replaced: an older
+			// clipsync is most likely still running from it.
+			return false, first, errors.New("an older clipsync is still running. Click its icon next to the clock, choose Quit clipsync, then open this file again")
+		}
+		return false, first, nil // cannot install; run from here
 	}
 	setRunKey(dst)
-	args := []string{}
+	args := append([]string{}, extra...)
 	if first {
 		args = append(args, "-first-run")
 	}
-	if err := exec.Command(dst, args...).Start(); err != nil {
-		return false, first, nil // run from here instead
+	cmd := exec.Command(dst, args...)
+	cmd.Dir = filepath.Dir(dst) // not the download folder, so it can be deleted
+	release()
+	if err := cmd.Start(); err != nil {
+		return false, first, fmt.Errorf("cannot start the installed clipsync: %w", err)
 	}
 	return true, first, nil
 }
@@ -204,5 +222,9 @@ func copyFile(src, dst string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dst)
+	if err := os.Rename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }

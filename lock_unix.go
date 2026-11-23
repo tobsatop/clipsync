@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -20,6 +21,9 @@ func acquireInstanceLock(dir string) (func(), error) {
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, errAlreadyRunning
+		}
 		return nil, err
 	}
 	return func() {

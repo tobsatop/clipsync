@@ -27,6 +27,10 @@ const version = "0.3.0"
 
 var commands = []string{"tray", "run", "pair", "status", "unpair", "help", "version", "pair-window"}
 
+// errAlreadyRunning is returned by acquireInstanceLock when another
+// clipsync holds the lock.
+var errAlreadyRunning = errors.New("already running")
+
 // errRunning means the menu-bar / tray copy holds the settings.
 var errRunning = errors.New("clipsync is running in the menu bar / next to the clock — quit it first (click its icon, then Quit clipsync)")
 
@@ -34,7 +38,8 @@ func main() { os.Exit(run()) }
 
 func run() int {
 	fs := flag.NewFlagSet("clipsync", flag.ContinueOnError)
-	fs.Usage = usage
+	fs.Usage = func() {}
+	fs.SetOutput(io.Discard) // errors are printed below, once a console exists
 	peerAddr := fs.String("peer", "", "")
 	verbose := fs.Bool("v", false, "")
 	firstRun := fs.Bool("first-run", false, "") // set by the Windows installer step
@@ -48,9 +53,13 @@ func run() int {
 		useConsole(cmd == "run" || cmd == "pair" || cmd == "pair-window")
 	}
 	if err := fs.Parse(flags); err != nil {
+		useConsole(false)
 		if errors.Is(err, flag.ErrHelp) {
+			usage()
 			return 0
 		}
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		usage()
 		return 2
 	}
 
@@ -136,8 +145,11 @@ func dispatch(ctx context.Context, cmd string, pos []string, peerAddr string, ve
 	// the tray copy (pair-window is started by the tray itself).
 	if cmd == "run" || cmd == "pair" || cmd == "unpair" {
 		release, err := acquireInstanceLock(dir)
-		if err != nil {
+		if errors.Is(err, errAlreadyRunning) {
 			return errRunning
+		}
+		if err != nil {
+			return err
 		}
 		defer release()
 	}

@@ -48,13 +48,19 @@ func useConsole(interactive bool) {
 	setupConsole()
 }
 
+// bindConsole points Go's and Windows' standard handles at the console.
+// A program started by another (os/exec gives it NUL handles) keeps those
+// even after AllocConsole, so they are replaced explicitly.
 func bindConsole() (in, out *os.File) {
 	if f, err := os.OpenFile("CONOUT$", os.O_RDWR, 0); err == nil {
 		os.Stdout, os.Stderr, out = f, f, f
+		windows.SetStdHandle(windows.STD_OUTPUT_HANDLE, windows.Handle(f.Fd()))
+		windows.SetStdHandle(windows.STD_ERROR_HANDLE, windows.Handle(f.Fd()))
 	}
 	if f, err := os.OpenFile("CONIN$", os.O_RDWR, 0); err == nil {
 		os.Stdin, in = f, f
 		stdin = bufio.NewReader(f)
+		windows.SetStdHandle(windows.STD_INPUT_HANDLE, windows.Handle(f.Fd()))
 	}
 	return in, out
 }

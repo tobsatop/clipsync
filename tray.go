@@ -50,23 +50,32 @@ type uiState struct {
 }
 
 func runTray(ctx context.Context, cfg *config.Config, dir, peerAddr string, verbose, firstRun bool) error {
-	handoff, first, err := prepareTray(cfg, dir)
-	if err != nil {
-		return err
-	}
-	if handoff {
-		return nil // the installed copy takes over
-	}
-	release, err := acquireInstanceLock(dir)
-	if err != nil {
+	lock, err := acquireInstanceLock(dir)
+	if errors.Is(err, errAlreadyRunning) {
 		return errors.New("clipsync is already running — look for its icon in the menu bar or next to the clock")
 	}
+	if err != nil {
+		return fmt.Errorf("cannot start: %w", err)
+	}
+	var once sync.Once
+	release := func() { once.Do(lock) }
 	defer release()
 	if peerAddr != "" && cfg.Peer != nil {
 		cfg.Peer.Addr = withDefaultPort(peerAddr)
 		if err := cfg.Save(dir); err != nil {
 			return err
 		}
+	}
+	var extra []string
+	if verbose {
+		extra = append(extra, "-v")
+	}
+	handoff, first, err := prepareTray(cfg, dir, extra, release)
+	if err != nil {
+		return err
+	}
+	if handoff {
+		return nil // the installed copy takes over
 	}
 
 	logger, logPath, closeLog, err := openLog(dir)

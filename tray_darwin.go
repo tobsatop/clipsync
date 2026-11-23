@@ -76,7 +76,7 @@ func openPath(p string) { exec.Command("open", "-t", p).Start() }
 
 // prepareTray turns start-at-login on the first time clipsync runs as an
 // app, and afterwards keeps the login item pointing at this copy.
-func prepareTray(cfg *config.Config, dir string) (handoff, first bool, err error) {
+func prepareTray(cfg *config.Config, dir string, _ []string, _ func()) (handoff, first bool, err error) {
 	first = !cfg.AutostartSet
 	if first {
 		cfg.AutostartSet = true

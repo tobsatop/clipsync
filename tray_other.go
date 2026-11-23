@@ -22,7 +22,9 @@ func notify(title, msg string) {}
 func firstRunHint()            {}
 func openPath(p string)        { exec.Command("xdg-open", p).Start() }
 
-func prepareTray(*config.Config, string) (bool, bool, error) { return false, false, nil }
+func prepareTray(*config.Config, string, []string, func()) (bool, bool, error) {
+	return false, false, nil
+}
 
 func trayPair(a *trayApp) (*config.Config, string, error) {
 	res, err := pairInteractive(a.ctx, a.cfg, a.dir, "", consoleUI{})
