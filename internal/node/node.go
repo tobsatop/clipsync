@@ -35,6 +35,8 @@ const (
 	// dial; an older session that a new one challenges is presumed dead.
 	tieBreakWindow = 5 * time.Second
 	warnAfterFails = 6
+	// maxReadAttempts: polls spent on one copy whose read keeps failing.
+	maxReadAttempts = 3
 )
 
 type Options struct {
@@ -430,6 +432,7 @@ func (n *Node) serve(ctx context.Context, s *wire.Session) {
 
 func (n *Node) clipLoop(ctx context.Context) {
 	last := n.clip.Seq()
+	attempts := 0
 	t := time.NewTicker(n.opt.PollInterval)
 	defer t.Stop()
 	for {
@@ -442,23 +445,33 @@ func (n *Node) clipLoop(ctx context.Context) {
 		if cur == last {
 			continue
 		}
-		last = cur
 		n.mu.Lock()
 		ours := n.hasIgnore && cur == n.ignoreSeq
 		n.mu.Unlock()
 		if ours {
+			last = cur
 			continue // our own write of a received item
 		}
-		n.onLocalCopy(ctx, cur)
+		// A read that fails for a passing reason (another app holding the
+		// clipboard) is retried on the next ticks before giving up.
+		attempts++
+		if n.onLocalCopy(ctx, cur, attempts >= maxReadAttempts) || attempts >= maxReadAttempts {
+			last, attempts = cur, 0
+		}
 	}
 }
 
-func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
+// onLocalCopy handles a new local copy. It returns false when reading
+// failed for a reason worth retrying; lastTry makes it report that failure.
+func (n *Node) onLocalCopy(ctx context.Context, seq int64, lastTry bool) bool {
 	n.clipMu.Lock()
-	it, ok := n.takeLocalCopy(ctx, seq)
+	it, ok, retry := n.takeLocalCopy(ctx, seq, lastTry)
 	n.clipMu.Unlock()
+	if retry {
+		return false
+	}
 	if !ok {
-		return
+		return true
 	}
 	n.mu.Lock()
 	s := n.sess
@@ -466,39 +479,44 @@ func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
 	n.mu.Unlock()
 	if s == nil {
 		n.logThrottled("offline", time.Minute, "Copied, but %s is not connected — it will get it on reconnect (within 2 minutes)", name)
-		return
+		return true
 	}
 	n.send(s, it, name, "")
+	return true
 }
 
 // takeLocalCopy reads a new local copy and records it as pending. Call with
-// clipMu held.
-func (n *Node) takeLocalCopy(ctx context.Context, seq int64) (clip.Item, bool) {
+// clipMu held. retry reports a passing failure worth another try.
+func (n *Node) takeLocalCopy(ctx context.Context, seq int64, lastTry bool) (_ clip.Item, ok, retry bool) {
 	it, err := n.clip.Read(ctx)
 	switch {
 	case errors.Is(err, clip.ErrSensitive):
 		n.logf("Password copied — not sent (password-manager items stay on this computer)")
-		return clip.Item{}, false
+		return clip.Item{}, false, false
 	case errors.Is(err, clip.ErrFiles):
 		n.logThrottled("files", 10*time.Minute, "Files copied — not sent (only text and images are synced)")
-		return clip.Item{}, false
+		return clip.Item{}, false, false
 	case errors.Is(err, clip.ErrNothing):
-		return clip.Item{}, false
+		return clip.Item{}, false, false
+	case errors.Is(err, clip.ErrBusy):
+		return clip.Item{}, false, !lastTry
 	case err != nil:
-		n.logThrottled("readerr", time.Minute, "Could not read what was copied: %v", err)
-		return clip.Item{}, false
+		if lastTry {
+			n.logThrottled("readerr", time.Minute, "Could not read what was copied: %v", err)
+		}
+		return clip.Item{}, false, !lastTry
 	}
 	if n.clip.Seq() != seq {
-		return clip.Item{}, false // changed while we read it; the next tick handles it
+		return clip.Item{}, false, false // changed while we read it; the next tick handles it
 	}
 	if len(it.Text) > maxText {
 		n.logf("Copied text is too large to send (%d MB)", len(it.Text)>>20)
-		return clip.Item{}, false
+		return clip.Item{}, false, false
 	}
 	if len(it.Image) > maxImage {
 		if len(it.Text) == 0 {
 			n.logf("Copied image is too large to send (%s)", size(len(it.Image)))
-			return clip.Item{}, false
+			return clip.Item{}, false, false
 		}
 		it.Image = nil // still send the text
 	}
@@ -506,11 +524,11 @@ func (n *Node) takeLocalCopy(ctx context.Context, seq int64) (clip.Item, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.hasHash && h == n.lastHash {
-		return clip.Item{}, false // what we just received, or already sent
+		return clip.Item{}, false, false // what we just received, or already sent
 	}
 	n.lastHash, n.hasHash = h, true
 	n.pending = &outItem{item: it, hash: h, at: time.Now()}
-	return it, true
+	return it, true, false
 }
 
 func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {

@@ -31,6 +31,9 @@ var (
 	// ErrFiles means files were copied (as in Finder or Explorer), which
 	// clipsync does not send.
 	ErrFiles = errors.New("files were copied")
+	// ErrBusy means the clipboard listed nothing, which happens both when it
+	// is empty and when another app holds it; worth a quiet retry.
+	ErrBusy = errors.New("clipboard busy or empty")
 )
 
 type Clipboard interface {
@@ -65,6 +68,16 @@ type Memory struct {
 	has       bool
 	sensitive bool
 	writes    int
+	failReads int // test hook: make the next reads fail
+	failErr   error
+}
+
+// FailReads makes the next n reads return err, like a clipboard held by
+// another app.
+func (m *Memory) FailReads(n int, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failReads, m.failErr = n, err
 }
 
 func NewMemory() *Memory { return &Memory{} }
@@ -102,6 +115,10 @@ func (m *Memory) Seq() int64 {
 func (m *Memory) Read(context.Context) (Item, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failReads > 0 {
+		m.failReads--
+		return Item{}, m.failErr
+	}
 	if !m.has {
 		return Item{}, ErrNothing
 	}

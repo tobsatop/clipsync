@@ -73,6 +73,9 @@ func copyClipboardBitmap() ([]byte, error) {
 
 	h, _, _ := procGetClipboardData.Call(format)
 	if h == 0 {
+		if r, _, _ := procIsClipboardFormatAvailable.Call(format); r == 0 {
+			return nil, clipboard.ErrNoData // replaced since we checked
+		}
 		return nil, errors.New("the app that copied the image could not provide it")
 	}
 	size, _, _ := procGlobalSize.Call(h)
@@ -93,7 +96,7 @@ func copyClipboardBitmap() ([]byte, error) {
 }
 
 func openClipboard() error {
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second) // as long as the library waits
 	for {
 		if r, _, _ := procOpenClipboard.Call(0); r != 0 {
 			return nil

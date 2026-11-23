@@ -99,6 +99,8 @@ func TestDIBLayouts(t *testing.T) {
 	checkPixels(t, "bitfields after header", makeDIB(40, 4, 2, 32, 3, 0, false, zeroA), 4, 2, opaque)
 	// V5 with an alpha mask and real alpha keeps transparency.
 	checkPixels(t, "V5 with alpha", makeDIB(124, 4, 4, 32, 3, 0xFF000000, false, half), 4, 4, half)
+	// V5 with BI_RGB and an alpha mask (as golang.design writes) keeps it too.
+	checkPixels(t, "V5 BI_RGB with alpha", makeDIB(124, 4, 4, 32, 0, 0xFF000000, false, half), 4, 4, half)
 	// V5 with an alpha mask but all-zero alpha is opaque, not invisible.
 	checkPixels(t, "V5 unused alpha", makeDIB(124, 4, 4, 32, 3, 0xFF000000, false, zeroA), 4, 4, opaque)
 	// Odd width exercises row padding.

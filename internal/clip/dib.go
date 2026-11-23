@@ -66,11 +66,12 @@ func dibToImage(b []byte) (image.Image, error) {
 		if r != 0x00FF0000 || g != 0x0000FF00 || bl != 0x000000FF {
 			return nil, fmt.Errorf("%w (channel masks)", errUnsupportedDIB)
 		}
-		if hdr >= 56 {
-			alphaMask = le.Uint32(b[52:])
-		}
 	default:
 		return nil, fmt.Errorf("%w (compression %d)", errUnsupportedDIB, comp)
+	}
+	// V3+ headers carry an alpha mask that applies with BI_RGB too.
+	if hdr >= 56 && bpp == 32 {
+		alphaMask = le.Uint32(b[52:])
 	}
 	if clrUsed < 0 || clrUsed > 256 {
 		return nil, errors.New("bad bitmap color table")

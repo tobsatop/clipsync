@@ -56,6 +56,11 @@ func (*System) Read(ctx context.Context) (Item, error) {
 	if err != nil {
 		return Item{}, err
 	}
+	if len(formats) == 0 {
+		// Without the list we cannot apply the text-only rule, so do not
+		// guess (an Excel copy would otherwise go out as a picture).
+		return Item{}, ErrBusy
+	}
 	if slices.Contains(formats, clipboard.FmtFiles) {
 		return Item{}, ErrFiles
 	}
@@ -63,17 +68,23 @@ func (*System) Read(ctx context.Context) (Item, error) {
 	// When text is on the clipboard, send only the text (owner's choice):
 	// asking apps such as Excel for their picture of every copy is slow, and
 	// many apps would paste the picture instead of the text.
+	var text []byte
 	if slices.Contains(formats, clipboard.FmtText) {
 		b, err := clipboard.Read(ctx, clipboard.FmtText)
 		if err != nil && !errors.Is(err, clipboard.ErrNoData) {
 			return Item{}, err
 		}
-		if t := NormalizeText(b); len(t) > 0 {
-			return Item{Text: t}, nil
+		text = NormalizeText(b)
+		if len(bytes.TrimSpace(text)) > 0 {
+			return Item{Text: text}, nil
 		}
 	}
+	// No real text (at most whitespace an app put beside a picture).
 	img, err := readImage(ctx)
 	if errors.Is(err, clipboard.ErrNoData) {
+		if len(text) > 0 {
+			return Item{Text: text}, nil
+		}
 		return Item{}, ErrNothing
 	}
 	if err != nil {

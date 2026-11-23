@@ -3,6 +3,7 @@ package node
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -244,4 +245,19 @@ func TestDecodeItemRejectsBadInput(t *testing.T) {
 	if err != nil || string(got.Text) != "hi\nthere" || !bytes.Equal(got.Image, it.Image) {
 		t.Fatalf("round trip: %v %q", err, got.Text)
 	}
+}
+
+func TestBusyClipboardIsRetried(t *testing.T) {
+	_, _, _, memA, memB := pairUp(t)
+	memA.FailReads(2, errors.New("the clipboard is busy"))
+	memA.Copy(clip.Item{Text: []byte("after a busy moment")}, false)
+	waitFor(t, "copy after two failed reads", func() bool { return text(memB) == "after a busy moment" })
+
+	// A clipboard that stays unreadable is given up on, and the next copy works.
+	memA.FailReads(10, clip.ErrBusy)
+	memA.Copy(clip.Item{Text: []byte("never readable")}, false)
+	time.Sleep(200 * time.Millisecond)
+	memA.FailReads(0, nil)
+	memA.Copy(clip.Item{Text: []byte("next copy")}, false)
+	waitFor(t, "next copy", func() bool { return text(memB) == "next copy" })
 }
