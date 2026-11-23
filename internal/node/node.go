@@ -1,0 +1,619 @@
+// Package node keeps the two clipboards in sync: it watches this one, keeps
+// a connection to the paired computer, and applies what arrives.
+package node
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"log"
+	"net"
+	"strconv"
+	"sync"
+	"time"
+	"unicode/utf8"
+
+	"clipsync/internal/clip"
+	"clipsync/internal/config"
+	"clipsync/internal/lan"
+	"clipsync/internal/wire"
+)
+
+const (
+	maxText      = 16 << 20
+	pingEvery    = 10 * time.Second
+	readTimeout  = 35 * time.Second
+	beaconEvery  = 3 * time.Second
+	resendWithin = 2 * time.Minute // unconfirmed copies older than this are dropped
+	maxHandshake = 8               // concurrent logins from not-yet-trusted connections
+	// tieBreakWindow: two sessions this close together are a simultaneous
+	// dial; an older session that a new one challenges is presumed dead.
+	tieBreakWindow = 5 * time.Second
+	warnAfterFails = 6
+)
+
+type Options struct {
+	PollInterval time.Duration // how often to check the clipboard; default 250ms
+	RedialEvery  time.Duration // how often to retry the peer; default 5s
+	Verbose      bool
+}
+
+// outItem is a local copy the peer has not confirmed yet.
+type outItem struct {
+	item clip.Item
+	hash [32]byte
+	at   time.Time
+}
+
+type Node struct {
+	cfg  *config.Config
+	dir  string // where to save config changes; "" means don't save
+	clip clip.Clipboard
+	log  *log.Logger
+	opt  Options
+
+	ln     net.Listener
+	udp    *net.UDPConn
+	port   int
+	hsSem  chan struct{}
+	wg     sync.WaitGroup
+	saveMu sync.Mutex
+
+	mu        sync.Mutex
+	sess      *wire.Session
+	lastHash  [32]byte // what both clipboards hold, as far as we know
+	hasHash   bool
+	pending   *outItem
+	dialing   bool
+	dialFails int
+	candidate string // address from a beacon; not trusted until a login works
+	throttle  map[string]time.Time
+}
+
+func New(cfg *config.Config, dir string, cb clip.Clipboard, logger *log.Logger, opt Options) *Node {
+	if opt.PollInterval == 0 {
+		opt.PollInterval = 250 * time.Millisecond
+	}
+	if opt.RedialEvery == 0 {
+		opt.RedialEvery = 5 * time.Second
+	}
+	return &Node{
+		cfg: cfg, dir: dir, clip: cb, log: logger, opt: opt,
+		hsSem:    make(chan struct{}, maxHandshake),
+		throttle: map[string]time.Time{},
+	}
+}
+
+// Start opens the ports and begins syncing in the background.
+func (n *Node) Start(ctx context.Context) error {
+	if n.cfg.Peer == nil {
+		return errors.New("not paired")
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", n.cfg.Port))
+	if err != nil {
+		return fmt.Errorf("cannot open TCP port %d — is clipsync already running, or is another app using it? (%v)", n.cfg.Port, err)
+	}
+	n.ln = ln
+	n.port = ln.Addr().(*net.TCPAddr).Port
+	if n.cfg.BeaconPort != 0 {
+		udp, err := lan.Listen(n.cfg.BeaconPort)
+		if err != nil {
+			ln.Close()
+			return fmt.Errorf("cannot open UDP port %d — is clipsync already running, or is another app using it? (%v)", n.cfg.BeaconPort, err)
+		}
+		n.udp = udp
+	}
+
+	n.run(func() {
+		<-ctx.Done()
+		n.ln.Close()
+		if n.udp != nil {
+			n.udp.Close()
+		}
+		n.mu.Lock()
+		if n.sess != nil {
+			n.sess.Close()
+			n.sess = nil
+		}
+		n.mu.Unlock()
+	})
+	n.run(func() { n.acceptLoop(ctx) })
+	n.run(func() { n.redialLoop(ctx) })
+	n.run(func() { n.clipLoop(ctx) })
+	if n.udp != nil {
+		n.run(func() { n.beaconSendLoop(ctx) })
+		n.run(func() { n.beaconRecvLoop(ctx) })
+	}
+	return nil
+}
+
+func (n *Node) run(f func()) {
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		f()
+	}()
+}
+
+// Wait blocks until the context given to Start is done and loops have ended.
+func (n *Node) Wait() { n.wg.Wait() }
+
+// ListenAddr is the local TCP address (useful when Port was 0).
+func (n *Node) ListenAddr() string { return n.ln.Addr().String() }
+
+// Connected reports whether a session with the peer is up.
+func (n *Node) Connected() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.sess != nil
+}
+
+// SetPeerAddr tells the node where the peer listens.
+func (n *Node) SetPeerAddr(addr string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.cfg.Peer.Addr = addr
+}
+
+func (n *Node) self() wire.Identity {
+	return wire.Identity{ID: n.cfg.DeviceID, Name: n.cfg.Name, Port: n.port}
+}
+
+func (n *Node) peer() config.Peer {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return *n.cfg.Peer
+}
+
+// --- connections -----------------------------------------------------------
+
+func (n *Node) acceptLoop(ctx context.Context) {
+	for {
+		conn, err := n.ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		select {
+		case n.hsSem <- struct{}{}:
+			go func() {
+				defer func() { <-n.hsSem }()
+				n.handleIncoming(ctx, conn)
+			}()
+		default:
+			conn.Close() // too many logins in progress; the peer will retry
+		}
+	}
+}
+
+func (n *Node) handleIncoming(ctx context.Context, conn net.Conn) {
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	h, err := wire.ReadHello(conn)
+	if err != nil {
+		n.debugf("ignored connection from %s: %v", conn.RemoteAddr(), err)
+		conn.Close()
+		return
+	}
+	peer := n.peer()
+	if h.Mode != wire.ModeSync {
+		n.debugf("ignored a pairing request from %q; run 'clipsync pair' to pair again", h.Name)
+		conn.Close()
+		return
+	}
+	if h.ID != peer.ID {
+		n.logThrottled("stranger", time.Minute, "Ignored %q at %s — it is not paired with this computer", h.Name, conn.RemoteAddr())
+		conn.Close()
+		return
+	}
+	s, err := wire.AcceptSync(conn, h, n.self(), peer.Key)
+	if err != nil {
+		if errors.Is(err, wire.ErrBadKey) {
+			n.logThrottled("badkey", time.Minute, "A computer calling itself %q at %s could not log in (keys do not match). If this keeps happening, run 'clipsync unpair' on both and pair again.", peer.Name, conn.RemoteAddr())
+		} else {
+			n.debugf("login from %s failed: %v", conn.RemoteAddr(), err)
+		}
+		conn.Close()
+		return
+	}
+	n.adopt(ctx, s)
+}
+
+func (n *Node) redialLoop(ctx context.Context) {
+	n.tryDial(ctx)
+	t := time.NewTicker(n.opt.RedialEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			n.tryDial(ctx)
+		}
+	}
+}
+
+// tryDial connects to the peer if no session is up: first at the address a
+// beacon suggested, then at the address of the last successful login.
+func (n *Node) tryDial(ctx context.Context) {
+	n.mu.Lock()
+	if n.sess != nil || n.dialing || ctx.Err() != nil {
+		n.mu.Unlock()
+		return
+	}
+	var targets []string
+	if n.candidate != "" {
+		targets = append(targets, n.candidate)
+	}
+	if a := n.cfg.Peer.Addr; a != "" && a != n.candidate {
+		targets = append(targets, a)
+	}
+	n.candidate = ""
+	if len(targets) == 0 {
+		n.mu.Unlock()
+		return
+	}
+	n.dialing = true
+	peer := *n.cfg.Peer
+	n.mu.Unlock()
+
+	go func() {
+		defer func() {
+			n.mu.Lock()
+			n.dialing = false
+			n.mu.Unlock()
+		}()
+		var lastErr error
+		for _, addr := range targets {
+			s, err := wire.Dial(ctx, addr, n.self(), peer.ID, peer.Key)
+			if err == nil {
+				n.adopt(ctx, s)
+				return
+			}
+			lastErr = err
+			n.debugf("connect to %s at %s: %v", peer.Name, addr, err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		n.mu.Lock()
+		n.dialFails++
+		fails := n.dialFails
+		n.mu.Unlock()
+		switch {
+		case errors.Is(lastErr, wire.ErrBadKey):
+			n.logThrottled("badkey", time.Minute, "Reached %q but could not log in (keys do not match). Run 'clipsync unpair' on both and pair again.", peer.Name)
+		case fails >= warnAfterFails:
+			n.logThrottled("unreachable", 5*time.Minute,
+				"Still cannot reach %s (last tried %s). Check: clipsync is running there; both are on the same Wi-Fi; "+
+					"on Windows, clipsync is allowed in the firewall; on Mac, Terminal has Local Network access "+
+					"(System Settings > Privacy & Security > Local Network). If its IP changed, run: clipsync -peer NEW-IP",
+				peer.Name, targets[len(targets)-1])
+		}
+	}()
+}
+
+// adopt makes s the active session. When both computers dial each other at
+// once, both keep the connection opened by the computer with the smaller ID
+// and drop the other, so they always agree. Otherwise the newest session
+// wins: a computer only dials when it has no working session.
+func (n *Node) adopt(ctx context.Context, s *wire.Session) {
+	if ctx.Err() != nil {
+		s.Close()
+		return
+	}
+	preferred := func(x *wire.Session) bool {
+		dialer, listener := x.PeerID, n.cfg.DeviceID
+		if x.Dialed {
+			dialer, listener = n.cfg.DeviceID, x.PeerID
+		}
+		return dialer < listener
+	}
+	n.mu.Lock()
+	old := n.sess
+	if old != nil && preferred(old) && !preferred(s) && s.Started.Sub(old.Started) < tieBreakWindow {
+		n.mu.Unlock()
+		s.Close()
+		return
+	}
+	n.sess = s
+	n.dialFails = 0
+	n.candidate = ""
+	// We no longer know what the peer holds; resend our last copy if the
+	// peer never confirmed it and it is still fresh.
+	n.hasHash = false
+	var resend *outItem
+	if n.pending != nil && time.Since(n.pending.at) <= resendWithin {
+		resend = n.pending
+		n.lastHash, n.hasHash = resend.hash, true
+	} else {
+		n.pending = nil
+	}
+	name := n.cfg.Peer.Name
+	n.mu.Unlock()
+
+	if old != nil {
+		old.Close()
+	} else {
+		n.logf("Connected to %s (%s)", name, s.RemoteHost())
+	}
+	n.notePeerAddr(s.PeerAddr())
+	go n.serve(ctx, s)
+	if resend != nil {
+		n.send(s, resend.item, name, " (copied while disconnected)")
+	}
+}
+
+func (n *Node) serve(ctx context.Context, s *wire.Session) {
+	done := make(chan struct{})
+	defer func() {
+		close(done)
+		s.Close()
+		n.mu.Lock()
+		current := n.sess == s
+		if current {
+			n.sess = nil
+		}
+		name := n.cfg.Peer.Name
+		n.mu.Unlock()
+		if current && ctx.Err() == nil {
+			n.logf("Lost connection to %s — reconnecting automatically", name)
+		}
+	}()
+	go func() {
+		t := time.NewTicker(pingEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				if err := s.Send(wire.MsgPing, nil); err != nil {
+					s.Close()
+					return
+				}
+			}
+		}
+	}()
+	for {
+		typ, payload, err := s.Recv(readTimeout)
+		if err != nil {
+			n.debugf("session ended: %v", err)
+			return
+		}
+		switch typ {
+		case wire.MsgPing:
+		case wire.MsgAck:
+			n.mu.Lock()
+			if n.pending != nil && bytes.Equal(n.pending.hash[:], payload) {
+				n.pending = nil
+			}
+			n.mu.Unlock()
+		case wire.MsgText:
+			if !utf8.Valid(payload) {
+				n.debugf("dropped text that is not valid UTF-8")
+				continue
+			}
+			n.receive(ctx, s, clip.Item{Kind: clip.Text, Data: clip.NormalizeText(payload)})
+		default:
+			n.debugf("ignored message type %d", typ)
+		}
+	}
+}
+
+// --- clipboard -------------------------------------------------------------
+
+func (n *Node) clipLoop(ctx context.Context) {
+	last := n.clip.Seq()
+	t := time.NewTicker(n.opt.PollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		cur := n.clip.Seq()
+		if cur == last {
+			continue
+		}
+		last = cur
+		n.onLocalCopy(ctx, cur)
+	}
+}
+
+func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
+	it, err := n.clip.Read(ctx)
+	switch {
+	case errors.Is(err, clip.ErrSensitive):
+		n.logf("Password copied — not sent (password-manager items stay on this computer)")
+		return
+	case errors.Is(err, clip.ErrNothing):
+		return
+	case err != nil:
+		n.debugf("read clipboard: %v", err)
+		return
+	}
+	if n.clip.Seq() != seq {
+		return // changed while we read it; the next tick handles the newer copy
+	}
+	if len(it.Data) > maxText {
+		n.logf("Copied %s is too large to send (%d MB)", it.Kind, len(it.Data)>>20)
+		return
+	}
+	h := hashItem(it)
+	n.mu.Lock()
+	if n.hasHash && h == n.lastHash {
+		n.mu.Unlock()
+		return // what we just received, or already sent
+	}
+	n.lastHash, n.hasHash = h, true
+	n.pending = &outItem{item: it, hash: h, at: time.Now()}
+	s := n.sess
+	name := n.cfg.Peer.Name
+	n.mu.Unlock()
+
+	if s == nil {
+		n.logThrottled("offline", time.Minute, "Copied, but %s is not connected — it will get it on reconnect (within 2 minutes)", name)
+		return
+	}
+	n.send(s, it, name, "")
+}
+
+func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {
+	if err := s.Send(msgType(it.Kind), it.Data); err != nil {
+		n.logf("Could not send to %s (will retry on reconnect): %v", name, err)
+		s.Close()
+		return
+	}
+	n.logf("Sent to %s: %s%s", name, describe(it), note)
+}
+
+func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
+	h := hashItem(it)
+	defer s.Send(wire.MsgAck, h[:])
+	n.mu.Lock()
+	if n.hasHash && h == n.lastHash {
+		n.mu.Unlock()
+		return
+	}
+	prevHash, prevHas := n.lastHash, n.hasHash
+	n.lastHash, n.hasHash = h, true
+	n.pending = nil // the peer's copy is newer than any unconfirmed one of ours
+	name := n.cfg.Peer.Name
+	n.mu.Unlock()
+	if err := n.clip.Write(ctx, it); err != nil {
+		n.mu.Lock()
+		if n.lastHash == h {
+			n.lastHash, n.hasHash = prevHash, prevHas
+		}
+		n.mu.Unlock()
+		n.logf("Received %s from %s but could not put it on the clipboard: %v", it.Kind, name, err)
+		return
+	}
+	n.logf("Received from %s: %s — ready to paste", name, describe(it))
+}
+
+// --- discovery -------------------------------------------------------------
+
+func (n *Node) beaconSendLoop(ctx context.Context) {
+	b := lan.NewBeacon(lan.KindHere, n.cfg.DeviceID, n.cfg.Name, n.port)
+	t := time.NewTicker(beaconEvery)
+	defer t.Stop()
+	for {
+		if err := lan.Broadcast(n.udp, n.cfg.BeaconPort, b); err != nil {
+			n.debugf("broadcast: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (n *Node) beaconRecvLoop(ctx context.Context) {
+	for {
+		b, ip, err := lan.Read(n.udp)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if b.Kind != lan.KindHere || b.ID != n.peer().ID {
+			continue
+		}
+		// Beacons are unauthenticated: only a hint for the next dial. The
+		// address is saved after a login there succeeds.
+		addr := net.JoinHostPort(ip.String(), strconv.Itoa(b.Port))
+		n.mu.Lock()
+		if n.sess == nil && addr != n.cfg.Peer.Addr {
+			n.candidate = addr
+		}
+		n.mu.Unlock()
+		n.tryDial(ctx)
+	}
+}
+
+// notePeerAddr saves where the peer is after a successful login, so a
+// restart reconnects at once.
+func (n *Node) notePeerAddr(addr string) {
+	if addr == "" {
+		return
+	}
+	n.saveMu.Lock()
+	defer n.saveMu.Unlock()
+	n.mu.Lock()
+	if n.cfg.Peer.Addr == addr {
+		n.mu.Unlock()
+		return
+	}
+	n.cfg.Peer.Addr = addr
+	snapshot := *n.cfg
+	peer := *n.cfg.Peer
+	snapshot.Peer = &peer
+	n.mu.Unlock()
+
+	n.debugf("peer is now at %s", addr)
+	if n.dir != "" {
+		if err := snapshot.Save(n.dir); err != nil {
+			n.logf("Could not save settings: %v", err)
+		}
+	}
+}
+
+// --- helpers ---------------------------------------------------------------
+
+func hashItem(it clip.Item) [32]byte {
+	h := sha256.New()
+	h.Write([]byte{byte(it.Kind)})
+	h.Write(it.Data)
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+func msgType(k clip.Kind) byte {
+	if k == clip.Image {
+		return wire.MsgImage
+	}
+	return wire.MsgText
+}
+
+func describe(it clip.Item) string {
+	if it.Kind == clip.Text {
+		return fmt.Sprintf("text, %d characters", utf8.RuneCount(it.Data))
+	}
+	return fmt.Sprintf("%s, %d KB", it.Kind, (len(it.Data)+1023)/1024)
+}
+
+// Logging never happens while n.mu is held, and the writer given by main
+// never blocks, so a stalled console cannot stall syncing.
+
+func (n *Node) logf(format string, a ...any) { n.log.Printf(format, a...) }
+
+func (n *Node) debugf(format string, a ...any) {
+	if n.opt.Verbose {
+		n.log.Printf("[debug] "+format, a...)
+	}
+}
+
+// logThrottled logs at most once per interval for each key.
+func (n *Node) logThrottled(key string, every time.Duration, format string, a ...any) {
+	n.mu.Lock()
+	now := time.Now()
+	ok := now.Sub(n.throttle[key]) >= every
+	if ok {
+		n.throttle[key] = now
+	}
+	n.mu.Unlock()
+	if ok {
+		n.logf(format, a...)
+	}
+}
