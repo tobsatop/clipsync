@@ -4,8 +4,12 @@ set -eu
 cd "$(dirname "$0")/.."
 VERSION=$(sed -n 's/^const version = "\(.*\)"/\1/p' main.go)
 APP=dist/clipsync.app
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+rm -rf "$APP" build
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build
+
+# App icon: Windows resources (linked into the .exe) and a macOS .icns.
+go run ./tools/genicons -syso . -iconset build/clipsync.iconset
+iconutil -c icns build/clipsync.iconset -o "$APP/Contents/Resources/clipsync.icns"
 
 GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o "$APP/Contents/MacOS/clipsync" .
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -17,6 +21,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>CFBundleName</key><string>clipsync</string>
 	<key>CFBundleDisplayName</key><string>clipsync</string>
 	<key>CFBundleExecutable</key><string>clipsync</string>
+	<key>CFBundleIconFile</key><string>clipsync</string>
 	<key>CFBundlePackageType</key><string>APPL</string>
 	<key>CFBundleShortVersionString</key><string>$VERSION</string>
 	<key>CFBundleVersion</key><string>$VERSION</string>

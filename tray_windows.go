@@ -17,11 +17,13 @@ import (
 	"fyne.io/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
+
+	"clipsync/internal/icons"
 )
 
 var winIcons = sync.OnceValue(func() [2][]byte {
 	sizes := []int{16, 20, 24, 32, 48}
-	return [2][]byte{icoBytes(sizes, winShape(false)), icoBytes(sizes, winShape(true))}
+	return [2][]byte{icons.ICO(sizes, icons.WinTray(false)), icons.ICO(sizes, icons.WinTray(true))}
 })
 
 func setTrayIcon(connected bool) {

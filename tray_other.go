@@ -9,9 +9,13 @@ import (
 	"os/exec"
 
 	"fyne.io/systray"
+
+	"clipsync/internal/icons"
 )
 
-func setTrayIcon(connected bool) { systray.SetIcon(pngBytes(render(32, winShape(connected)))) }
+func setTrayIcon(connected bool) {
+	systray.SetIcon(icons.PNG(icons.Render(32, icons.WinTray(connected))))
+}
 
 func alert(title, msg string)  { fmt.Fprintf(os.Stderr, "%s: %s\n", title, msg) }
 func notify(title, msg string) {}

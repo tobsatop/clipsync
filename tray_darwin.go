@@ -16,13 +16,15 @@ import (
 	"sync"
 
 	"fyne.io/systray"
+
+	"clipsync/internal/icons"
 )
 
 // The menu bar must be driven from the main thread.
 func init() { runtime.LockOSThread() }
 
 var macIcons = sync.OnceValue(func() [2][]byte {
-	return [2][]byte{pngBytes(render(64, macShape(false))), pngBytes(render(64, macShape(true)))}
+	return [2][]byte{icons.PNG(icons.Render(64, icons.MacTray(false))), icons.PNG(icons.Render(64, icons.MacTray(true)))}
 })
 
 func setTrayIcon(connected bool) {
