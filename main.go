@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	version          = "0.1.0"
+	version          = "0.2.0"
 	maxPairAttempts  = 3
 	pairingLifetime  = 10 * time.Minute
 	discoveryTimeout = 60 * time.Second
