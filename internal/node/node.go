@@ -43,6 +43,18 @@ type Options struct {
 	PollInterval time.Duration // how often to check the clipboard; default 250ms
 	RedialEvery  time.Duration // how often to retry the peer; default 5s
 	Verbose      bool
+	// OnStatus, if set, is called (from any goroutine) whenever the
+	// connection or the last transfer changes.
+	OnStatus func(Status)
+}
+
+// Status is what a tray icon shows.
+type Status struct {
+	Connected bool
+	Peer      string
+	Paused    bool
+	Last      string // e.g. "Sent text, 12 characters"
+	LastAt    time.Time
 }
 
 // outItem is a local copy the peer has not confirmed yet.
@@ -78,6 +90,8 @@ type Node struct {
 	dialing   bool
 	dialFails int
 	candidate string // address from a beacon; not trusted until a login works
+	paused    bool
+	status    Status
 	// ignoreSeq is the clipboard counter right after we wrote a received
 	// item, so that write is not mistaken for a new copy (Windows reads an
 	// image back in a different encoding, so the hash alone is not enough).
@@ -169,6 +183,34 @@ func (n *Node) SetPeerAddr(addr string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.cfg.Peer.Addr = addr
+}
+
+// SetPaused stops (or resumes) sending local copies and applying received
+// ones. Copies made while paused are never sent.
+func (n *Node) SetPaused(p bool) {
+	n.mu.Lock()
+	n.paused = p
+	if p {
+		n.pending = nil
+	}
+	n.mu.Unlock()
+	n.report(func(st *Status) { st.Paused = p })
+}
+
+// report applies change to the status and passes a copy to OnStatus.
+func (n *Node) report(change func(*Status)) {
+	n.mu.Lock()
+	change(&n.status)
+	n.status.Peer = n.cfg.Peer.Name
+	st := n.status
+	n.mu.Unlock()
+	if n.opt.OnStatus != nil {
+		n.opt.OnStatus(st)
+	}
+}
+
+func (n *Node) noteTransfer(msg string) {
+	n.report(func(st *Status) { st.Last, st.LastAt = msg, time.Now() })
 }
 
 func (n *Node) self() wire.Identity {
@@ -362,6 +404,7 @@ func (n *Node) adopt(ctx context.Context, s *wire.Session) {
 		old.Close()
 	} else {
 		n.logf("Connected to %s (%s)", name, s.RemoteHost())
+		n.report(func(st *Status) { st.Connected = true })
 	}
 	n.notePeerAddr(s.PeerAddr())
 	go n.serve(ctx, s)
@@ -384,6 +427,9 @@ func (n *Node) serve(ctx context.Context, s *wire.Session) {
 		n.mu.Unlock()
 		if current && ctx.Err() == nil {
 			n.logf("Lost connection to %s — reconnecting automatically", name)
+		}
+		if current {
+			n.report(func(st *Status) { st.Connected = false })
 		}
 	}()
 	go func() {
@@ -451,6 +497,13 @@ func (n *Node) clipLoop(ctx context.Context) {
 		if ours {
 			last = cur
 			continue // our own write of a received item
+		}
+		n.mu.Lock()
+		paused := n.paused
+		n.mu.Unlock()
+		if paused {
+			last, attempts = cur, 0
+			continue
 		}
 		// A read that fails for a passing reason (another app holding the
 		// clipboard) is retried on the next ticks before giving up.
@@ -545,6 +598,7 @@ func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {
 		return
 	}
 	n.logf("Sent to %s: %s%s", name, describe(it), note)
+	n.noteTransfer("Sent " + describe(it))
 }
 
 func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
@@ -553,6 +607,10 @@ func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
 	n.clipMu.Lock()
 	defer n.clipMu.Unlock()
 	n.mu.Lock()
+	if n.paused {
+		n.mu.Unlock()
+		return // acknowledged but not applied
+	}
 	if n.hasHash && h == n.lastHash {
 		n.mu.Unlock()
 		return
@@ -581,6 +639,7 @@ func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
 		return
 	}
 	n.logf("Received from %s: %s — ready to paste", name, describe(it))
+	n.noteTransfer("Received " + describe(it))
 }
 
 // --- discovery -------------------------------------------------------------

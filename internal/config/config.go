@@ -34,6 +34,9 @@ type Config struct {
 	Port       int    `json:"port"`
 	BeaconPort int    `json:"beacon_port"`
 	Peer       *Peer  `json:"peer,omitempty"`
+	// AutostartSet records that start-at-login was set up once, so turning
+	// it off later is respected.
+	AutostartSet bool `json:"autostart_set,omitempty"`
 }
 
 // Dir is where the config lives. CLIPSYNC_HOME overrides it, which lets two

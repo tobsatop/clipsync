@@ -3,3 +3,4 @@
 package main
 
 func setupConsole() {}
+func useConsole()   {}

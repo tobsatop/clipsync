@@ -12,6 +12,8 @@ require (
 )
 
 require (
+	fyne.io/systray v1.12.2 // indirect
+	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/gtank/ristretto255 v0.1.2 // indirect
 	golang.design/x/x11 v0.2.0 // indirect
 	golang.org/x/crypto v0.59.0 // indirect

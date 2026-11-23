@@ -3,7 +3,11 @@ package main
 import (
 	"fmt"
 	"testing"
+
+	"clipsync/internal/clip"
 )
+
+var clipCheckPNG = clip.CheckPNG
 
 func TestNormalizeCode(t *testing.T) {
 	for in, want := range map[string]string{
@@ -30,5 +34,17 @@ func TestSplitArgs(t *testing.T) {
 	flags, pos := splitArgs([]string{"-v", "pair", "123456", "-peer", "192.168.1.5"})
 	if fmt.Sprint(flags) != "[-v -peer 192.168.1.5]" || fmt.Sprint(pos) != "[pair 123456]" {
 		t.Fatalf("flags=%v pos=%v", flags, pos)
+	}
+}
+
+func TestIcons(t *testing.T) {
+	for _, connected := range []bool{false, true} {
+		if err := clipCheckPNG(pngBytes(render(64, macShape(connected)))); err != nil {
+			t.Fatal(err)
+		}
+		ico := icoBytes([]int{16, 32, 48}, winShape(connected))
+		if len(ico) < 6 || ico[2] != 1 || ico[4] != 3 {
+			t.Fatalf("bad ico header % x", ico[:6])
+		}
 	}
 }
