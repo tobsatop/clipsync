@@ -309,3 +309,40 @@ func TestTamperedHelloFailsLogin(t *testing.T) {
 		t.Fatalf("want ErrBadKey, got %v", err)
 	}
 }
+
+func TestVersionMismatchIsReported(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	ln := listen(t)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		ReadHello(conn)
+		// An older clipsync answers with protocol 1.
+		writeJSON(conn, Hello{App: appName, V: 1, Mode: ModeSync, ID: host.ID, Name: "Old PC", Port: 1})
+	}()
+	_, err := Dial(context.Background(), ln.Addr().String(), joiner, host.ID, key)
+	if !errors.Is(err, ErrVersion) || !strings.Contains(err.Error(), "Old PC") {
+		t.Fatalf("want ErrVersion naming the peer, got %v", err)
+	}
+}
+
+func TestTooLargeIsNotANetworkError(t *testing.T) {
+	key := bytes.Repeat([]byte{7}, 32)
+	srv, cli, serr, cerr := connect(t, key, key)
+	if serr != nil || cerr != nil {
+		t.Fatal(serr, cerr)
+	}
+	if err := cli.Send(MsgItem, make([]byte, MaxPayload+1)); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("want ErrTooLarge, got %v", err)
+	}
+	// The session still works afterwards.
+	if err := cli.Send(MsgItem, []byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	if _, got, err := srv.Recv(time.Second); err != nil || string(got) != "ok" {
+		t.Fatalf("after too-large: %q %v", got, err)
+	}
+}

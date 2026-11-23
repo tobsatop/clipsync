@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -24,10 +25,21 @@ const (
 	MsgAck  byte = 5 // payload: SHA-256 of the item received
 )
 
-const writeTimeout = 2 * time.Minute
+const (
+	writeTimeout = 30 * time.Second
+	// minRate is the slowest transfer allowed before a large item counts as
+	// stalled: deadlines grow by the time the item needs at this rate.
+	minRate = 128 << 10 // bytes per second
+)
 
-// ErrBadKey means the other side could not prove it holds the pairing key.
-var ErrBadKey = errors.New("login failed: the pairing keys do not match")
+var (
+	// ErrBadKey means the other side could not prove it holds the pairing key.
+	ErrBadKey = errors.New("login failed: the pairing keys do not match")
+	// ErrTooLarge means an item exceeds MaxPayload; the session is fine.
+	ErrTooLarge = errors.New("item too large to send")
+)
+
+func transferTime(n int) time.Duration { return time.Duration(n) * time.Second / minRate }
 
 // Session is an authenticated, encrypted connection to the paired computer.
 //
@@ -81,6 +93,9 @@ func dialSync(conn net.Conn, self Identity, peerID string, key []byte) (*Session
 		return nil, err
 	}
 	h, err := ReadHello(conn)
+	if errors.Is(err, ErrVersion) {
+		return nil, err
+	}
 	if err != nil {
 		return nil, fmt.Errorf("the other computer closed the connection (is it paired with this one?): %w", err)
 	}
@@ -137,7 +152,7 @@ func finish(conn net.Conn, h *Hello, dialed bool, d2l, l2d []byte) (*Session, er
 	if err := s.Send(MsgAuth, nil); err != nil {
 		return nil, err
 	}
-	typ, _, err := s.recvFrame(handshakeMax)
+	typ, _, err := s.recvFrame(handshakeMax, handshakeTimeout)
 	if err != nil {
 		if errors.Is(err, ErrBadKey) {
 			return nil, err
@@ -203,28 +218,42 @@ func counterNonce(ctr uint64) []byte {
 // Send encrypts and sends one message. Safe for concurrent use.
 func (s *Session) Send(typ byte, payload []byte) error {
 	if len(payload) > MaxPayload {
-		return fmt.Errorf("item too large (%d bytes)", len(payload))
+		return fmt.Errorf("%w (%d MB)", ErrTooLarge, len(payload)>>20)
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	pt := make([]byte, 1+len(payload))
+	// One buffer holds the length, then the message encrypted in place.
+	frame := make([]byte, 4+1+len(payload)+s.send.Overhead())
+	pt := frame[4 : 4+1+len(payload)]
 	pt[0] = typ
 	copy(pt[1:], payload)
-	ct := s.send.Seal(nil, counterNonce(s.sendCtr), pt, nil)
+	ct := s.send.Seal(pt[:0], counterNonce(s.sendCtr), pt, nil)
 	s.sendCtr++
-	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return writeFrame(s.conn, ct)
+	binary.BigEndian.PutUint32(frame, uint32(len(ct)))
+	s.conn.SetWriteDeadline(time.Now().Add(writeTimeout + transferTime(len(ct))))
+	_, err := s.conn.Write(frame[:4+len(ct)])
+	return err
 }
 
-// Recv waits up to timeout for the next message. Call it from one goroutine.
+// Recv waits up to timeout for the next message to start, then as long as
+// its size needs at minRate. Call it from one goroutine.
 func (s *Session) Recv(timeout time.Duration) (byte, []byte, error) {
-	s.conn.SetReadDeadline(time.Now().Add(timeout))
-	return s.recvFrame(MaxPayload + 1 + 16)
+	return s.recvFrame(MaxPayload+1+16, timeout)
 }
 
-func (s *Session) recvFrame(max int) (byte, []byte, error) {
-	ct, err := readFrame(s.conn, max)
-	if err != nil {
+func (s *Session) recvFrame(max int, timeout time.Duration) (byte, []byte, error) {
+	s.conn.SetReadDeadline(time.Now().Add(timeout))
+	var hdr [4]byte
+	if _, err := io.ReadFull(s.conn, hdr[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if int64(n) > int64(max) {
+		return 0, nil, fmt.Errorf("message too large (%d bytes)", n)
+	}
+	s.conn.SetReadDeadline(time.Now().Add(timeout + transferTime(int(n))))
+	ct := make([]byte, n)
+	if _, err := io.ReadFull(s.conn, ct); err != nil {
 		return 0, nil, err
 	}
 	pt, err := s.recv.Open(nil, counterNonce(s.recvCtr), ct, nil)

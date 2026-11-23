@@ -25,7 +25,7 @@ import (
 
 const (
 	maxText      = 16 << 20
-	maxImage     = 48 << 20
+	maxImage     = 40 << 20
 	pingEvery    = 10 * time.Second
 	readTimeout  = 35 * time.Second
 	beaconEvery  = 3 * time.Second
@@ -63,6 +63,10 @@ type Node struct {
 	hsSem  chan struct{}
 	wg     sync.WaitGroup
 	saveMu sync.Mutex
+	// clipMu makes "read a local copy and record it" and "write a received
+	// item and record it" happen one at a time, so neither can overwrite
+	// the other's bookkeeping halfway.
+	clipMu sync.Mutex
 
 	mu        sync.Mutex
 	sess      *wire.Session
@@ -202,6 +206,12 @@ func (n *Node) acceptLoop(ctx context.Context) {
 func (n *Node) handleIncoming(ctx context.Context, conn net.Conn) {
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	h, err := wire.ReadHello(conn)
+	if errors.Is(err, wire.ErrVersion) {
+		wire.SendVersionHello(conn, n.self())
+		n.logThrottled("version", 5*time.Minute, "%v", err)
+		conn.Close()
+		return
+	}
 	if err != nil {
 		n.debugf("ignored connection from %s: %v", conn.RemoteAddr(), err)
 		conn.Close()
@@ -293,6 +303,8 @@ func (n *Node) tryDial(ctx context.Context) {
 		fails := n.dialFails
 		n.mu.Unlock()
 		switch {
+		case errors.Is(lastErr, wire.ErrVersion):
+			n.logThrottled("version", 5*time.Minute, "%v", lastErr)
 		case errors.Is(lastErr, wire.ErrBadKey):
 			n.logThrottled("badkey", time.Minute, "Reached %q but could not log in (keys do not match). Run 'clipsync unpair' on both and pair again.", peer.Name)
 		case fails >= warnAfterFails:
@@ -442,46 +454,16 @@ func (n *Node) clipLoop(ctx context.Context) {
 }
 
 func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
-	it, err := n.clip.Read(ctx)
-	switch {
-	case errors.Is(err, clip.ErrSensitive):
-		n.logf("Password copied — not sent (password-manager items stay on this computer)")
-		return
-	case errors.Is(err, clip.ErrFiles):
-		n.logThrottled("files", 10*time.Minute, "Files copied — not sent (only text and images are synced)")
-		return
-	case errors.Is(err, clip.ErrNothing):
-		return
-	case err != nil:
-		n.debugf("read clipboard: %v", err)
+	n.clipMu.Lock()
+	it, ok := n.takeLocalCopy(ctx, seq)
+	n.clipMu.Unlock()
+	if !ok {
 		return
 	}
-	if n.clip.Seq() != seq {
-		return // changed while we read it; the next tick handles the newer copy
-	}
-	if len(it.Text) > maxText {
-		n.logf("Copied text is too large to send (%d MB)", len(it.Text)>>20)
-		return
-	}
-	if len(it.Image) > maxImage {
-		if len(it.Text) == 0 {
-			n.logf("Copied image is too large to send (%d MB)", len(it.Image)>>20)
-			return
-		}
-		it.Image = nil // still send the text
-	}
-	h := hashItem(it)
 	n.mu.Lock()
-	if n.hasHash && h == n.lastHash {
-		n.mu.Unlock()
-		return // what we just received, or already sent
-	}
-	n.lastHash, n.hasHash = h, true
-	n.pending = &outItem{item: it, hash: h, at: time.Now()}
 	s := n.sess
 	name := n.cfg.Peer.Name
 	n.mu.Unlock()
-
 	if s == nil {
 		n.logThrottled("offline", time.Minute, "Copied, but %s is not connected — it will get it on reconnect (within 2 minutes)", name)
 		return
@@ -489,8 +471,57 @@ func (n *Node) onLocalCopy(ctx context.Context, seq int64) {
 	n.send(s, it, name, "")
 }
 
+// takeLocalCopy reads a new local copy and records it as pending. Call with
+// clipMu held.
+func (n *Node) takeLocalCopy(ctx context.Context, seq int64) (clip.Item, bool) {
+	it, err := n.clip.Read(ctx)
+	switch {
+	case errors.Is(err, clip.ErrSensitive):
+		n.logf("Password copied — not sent (password-manager items stay on this computer)")
+		return clip.Item{}, false
+	case errors.Is(err, clip.ErrFiles):
+		n.logThrottled("files", 10*time.Minute, "Files copied — not sent (only text and images are synced)")
+		return clip.Item{}, false
+	case errors.Is(err, clip.ErrNothing):
+		return clip.Item{}, false
+	case err != nil:
+		n.logThrottled("readerr", time.Minute, "Could not read what was copied: %v", err)
+		return clip.Item{}, false
+	}
+	if n.clip.Seq() != seq {
+		return clip.Item{}, false // changed while we read it; the next tick handles it
+	}
+	if len(it.Text) > maxText {
+		n.logf("Copied text is too large to send (%d MB)", len(it.Text)>>20)
+		return clip.Item{}, false
+	}
+	if len(it.Image) > maxImage {
+		if len(it.Text) == 0 {
+			n.logf("Copied image is too large to send (%s)", size(len(it.Image)))
+			return clip.Item{}, false
+		}
+		it.Image = nil // still send the text
+	}
+	h := hashItem(it)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.hasHash && h == n.lastHash {
+		return clip.Item{}, false // what we just received, or already sent
+	}
+	n.lastHash, n.hasHash = h, true
+	n.pending = &outItem{item: it, hash: h, at: time.Now()}
+	return it, true
+}
+
 func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {
 	if err := s.Send(wire.MsgItem, encodeItem(it)); err != nil {
+		if errors.Is(err, wire.ErrTooLarge) {
+			n.logf("Not sent to %s: %v", name, err)
+			n.mu.Lock()
+			n.pending = nil
+			n.mu.Unlock()
+			return
+		}
 		n.logf("Could not send to %s (will retry on reconnect): %v", name, err)
 		s.Close()
 		return
@@ -501,6 +532,8 @@ func (n *Node) send(s *wire.Session, it clip.Item, name, note string) {
 func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
 	h := hashItem(it)
 	defer s.Send(wire.MsgAck, h[:])
+	n.clipMu.Lock()
+	defer n.clipMu.Unlock()
 	n.mu.Lock()
 	if n.hasHash && h == n.lastHash {
 		n.mu.Unlock()
@@ -511,19 +544,24 @@ func (n *Node) receive(ctx context.Context, s *wire.Session, it clip.Item) {
 	n.pending = nil // the peer's copy is newer than any unconfirmed one of ours
 	name := n.cfg.Peer.Name
 	n.mu.Unlock()
-	if err := n.clip.Write(ctx, it); err != nil {
-		n.mu.Lock()
-		if n.lastHash == h {
-			n.lastHash, n.hasHash = prevHash, prevHas
-		}
-		n.mu.Unlock()
+
+	before := n.clip.Seq()
+	err := n.clip.Write(ctx, it)
+	after := n.clip.Seq()
+	n.mu.Lock()
+	if after != before {
+		// Whatever we put there (even half of it, if the write failed) is
+		// ours, not a new copy to send back.
+		n.ignoreSeq, n.hasIgnore = after, true
+	}
+	if err != nil {
+		n.lastHash, n.hasHash = prevHash, prevHas
+	}
+	n.mu.Unlock()
+	if err != nil {
 		n.logf("Received %s from %s but could not put it on the clipboard: %v", describe(it), name, err)
 		return
 	}
-	seq := n.clip.Seq()
-	n.mu.Lock()
-	n.ignoreSeq, n.hasIgnore = seq, true
-	n.mu.Unlock()
 	n.logf("Received from %s: %s — ready to paste", name, describe(it))
 }
 
@@ -641,7 +679,10 @@ func decodeItem(b []byte) (clip.Item, error) {
 	it.Text = clip.NormalizeText(it.Text)
 	if it.Image != nil {
 		if err := clip.CheckPNG(it.Image); err != nil {
-			return clip.Item{}, err
+			if it.Text == nil {
+				return clip.Item{}, err
+			}
+			it.Image = nil // keep the text
 		}
 	}
 	if it.Empty() {

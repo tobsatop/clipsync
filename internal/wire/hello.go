@@ -19,6 +19,9 @@ const (
 	handshakeTimeout = 10 * time.Second
 )
 
+// ErrVersion means the two computers run incompatible clipsync versions.
+var ErrVersion = errors.New("the two computers run different clipsync versions — update both")
+
 // Identity is how this computer introduces itself.
 type Identity struct {
 	ID   string
@@ -58,7 +61,8 @@ func sendHello(conn net.Conn, h *Hello) error {
 }
 
 // ReadHello reads and sanity-checks the peer's Hello. Name comes back
-// cleaned for display.
+// cleaned for display. On a version mismatch it returns the Hello too, with
+// an error wrapping ErrVersion.
 func ReadHello(conn net.Conn) (*Hello, error) {
 	b, err := readFrame(conn, handshakeMax)
 	if err != nil {
@@ -72,7 +76,8 @@ func ReadHello(conn net.Conn) (*Hello, error) {
 		return nil, errors.New("not a clipsync computer")
 	}
 	if h.V != protoVersion {
-		return nil, fmt.Errorf("the other computer runs a different clipsync version (protocol %d, this one %d) — update both", h.V, protoVersion)
+		h.Name = names.Clean(h.Name)
+		return &h, fmt.Errorf("%w (%q uses protocol %d, this computer %d)", ErrVersion, h.Name, h.V, protoVersion)
 	}
 	if h.ID == "" || len(h.ID) > 128 || h.Port < 0 || h.Port > 65535 {
 		return nil, errors.New("malformed hello")
@@ -80,6 +85,13 @@ func ReadHello(conn net.Conn) (*Hello, error) {
 	h.raw = b
 	h.Name = names.Clean(h.Name)
 	return &h, nil
+}
+
+// SendVersionHello answers a peer with a different version, so it can tell
+// its user to update instead of guessing at a network problem.
+func SendVersionHello(conn net.Conn, self Identity) {
+	h := newHello(ModeSync, self, nil)
+	sendHello(conn, &h)
 }
 
 func randBytes(n int) []byte {
