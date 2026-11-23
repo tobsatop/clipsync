@@ -3,8 +3,9 @@
 <h1 align="center">clipsync</h1>
 
 <p align="center">
-  <b>copy บน Windows แล้ววางบน Mac ได้ทันที และกลับกัน</b><br>
-  Copy on one computer, paste on the other — Windows ⇄ Mac, on the same Wi-Fi.
+  <b>Copy เครื่องไหน ก็วางอีกเครื่องได้ทันที</b><br>
+  ใช้ได้ระหว่าง Windows กับ Mac ที่ต่อ Wi-Fi เดียวกัน<br>
+  <sub>Copy on one computer, paste on the other — Windows ⇄ Mac, on the same Wi-Fi.</sub>
 </p>
 
 <p align="center">
@@ -13,7 +14,7 @@
   <a href="https://github.com/tobsatop/clipsync/releases/latest/download/clipsync-mac.zip"><b>⬇ ดาวน์โหลดสำหรับ Mac</b></a>
 </p>
 
-<p align="center"><img src="docs/how-it-works.svg" width="720" alt="copy บน Windows แล้ววางบน Mac ได้ทันที ได้ทั้งสองทาง"></p>
+<p align="center"><img src="docs/how-it-works.svg" width="720" alt="copy เครื่องหนึ่ง วางอีกเครื่องได้ทันที ได้ทั้งสองทาง"></p>
 
 - ส่งได้ทั้งข้อความ (ภาษาไทยได้) และรูป เช่น ภาพหน้าจอ
 - ไม่ต้องสมัคร ไม่มีเซิร์ฟเวอร์ ข้อมูลเข้ารหัสและส่งตรงกันภายในบ้าน
