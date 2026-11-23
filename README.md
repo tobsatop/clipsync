@@ -2,6 +2,13 @@
 
 copy บนเครื่องหนึ่ง แล้ววางบนอีกเครื่องได้เลย ใช้ได้ทั้ง Windows และ Mac ผ่าน Wi-Fi บ้านเดียวกัน
 
+> Sync the clipboard (text and images) between a Windows PC and a Mac on the same Wi-Fi.
+> One-time pairing with a 6-digit code, end-to-end encrypted, no server. Written in Go.
+
+> **คำเตือน:** โปรเจกต์ส่วนตัว ยังไม่ผ่านการตรวจโดยผู้เชี่ยวชาญด้านความปลอดภัย
+> ไลบรารีจับคู่ที่ใช้ (filippo.io/cpace) ยังเป็นรุ่นทดลอง ใช้ตามความเสี่ยงของตัวเอง
+> *Personal project, not security-audited; the pairing library is experimental. Use at your own risk.*
+
 - ส่งได้ทั้งข้อความ (ภาษาไทยได้) และรูป เช่น screenshot
 - ข้อมูลเข้ารหัสทุกครั้ง และส่งตรงระหว่างสองเครื่อง ไม่ผ่านเซิร์ฟเวอร์ใคร
 - รหัสผ่านที่ copy จากโปรแกรมเก็บรหัสผ่านจะไม่ถูกส่ง
@@ -78,3 +85,7 @@ CLIPSYNC_REAL_CLIPBOARD=1 go test -run TestRealMacClipboard ./internal/node/
 - `internal/node`: ดู clipboard, ส่ง/รับ, ต่อใหม่อัตโนมัติ, กันส่งวนซ้ำ
 - `internal/lan`: หาอีกเครื่องใน Wi-Fi ด้วย UDP broadcast
 - `internal/clip`: อ่าน/เขียน clipboard ของแต่ละระบบ, แปลงรูป bitmap ของ Windows (`dib.go`)
+
+## License
+
+MIT — ดู [LICENSE](LICENSE)
