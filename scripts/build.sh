@@ -8,6 +8,8 @@ rm -rf "$APP" build
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" build
 
 # App icon: Windows resources (linked into the .exe) and a macOS .icns.
+# The .syso files are removed afterwards so a later plain build can't pick up stale ones.
+trap 'rm -f rsrc_windows_*.syso' EXIT
 go run ./tools/genicons -syso . -iconset build/clipsync.iconset
 iconutil -c icns build/clipsync.iconset -o "$APP/Contents/Resources/clipsync.icns"
 
